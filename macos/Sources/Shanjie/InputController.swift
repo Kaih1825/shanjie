@@ -156,6 +156,7 @@ final class ClientAdapter: TextClient {
     /// answers every index with the START of the marked text (x does not move as it grows), nothing for the end, a reliable line
     /// height (font size = height / 1.178 for PingFang), and an unreliable font. So the end is the start plus the measured width of the
     /// preedit; a client that does answer per character (x grows with the index) gives the last character's left edge plus one em.
+    private var ghostSize: CGFloat?
     func ghostAnchor(cursor: Int, preedit: String) -> GhostAnchor? {
         guard let client else { return nil }
         let marked = client.markedRange()
@@ -171,18 +172,22 @@ final class ClientAdapter: TextClient {
         }
         let lastIndex = min(max(cursor - 1, 0), marked.length - 1)
         guard let last = rect(at: lastIndex) else { return nil }
-        let size = max(10, last.height / 1.178)
+        // Firefox reports a different line height as the preedit grows, so keep the smallest size seen in this composition.
+        var measured = max(10, last.height / 1.178)
+        // Where the client gives per-character rectangles, two neighbouring CJK characters are one em apart: the font size, whatever the line height is.
+        let head = Array(preedit.prefix(2)).map { $0.unicodeScalars.first!.value }
+        if head.count == 2, head.allSatisfy({ $0 >= 0x4E00 }), marked.length >= 2, let r0 = rect(at: 0), let r1 = rect(at: 1),
+           abs(r0.minY - r1.minY) < 2, r1.minX - r0.minX > 8, r1.minX - r0.minX < 80 {
+            measured = r1.minX - r0.minX
+        }
+        if cursor <= 1 || ghostSize == nil { ghostSize = measured } else { ghostSize = min(ghostSize!, measured) }
+        let size = ghostSize! * 1.08
         let font = NSFont.systemFont(ofSize: size)
         func width(_ s: String) -> CGFloat { NSAttributedString(string: s, attributes: [.font: font]).size().width }
+        // One rule for every client and length: the line is the first character's rectangle, the x is its left edge plus the measured width of the preedit.
         let first = rect(at: 0) ?? last
-        var x: CGFloat
-        if lastIndex > 0, abs(last.minX - first.minX) > 1, abs(last.minY - first.minY) < last.height / 2 {
-            let ch = String(preedit.dropFirst(max(lastIndex, 0)).prefix(1))
-            x = last.minX + width(ch.isEmpty ? "　" : ch)
-        } else {
-            x = first.minX + width(String(preedit.prefix(cursor)))
-        }
-        return GhostAnchor(x: x, line: last, font: font)
+        let x = first.minX + width(String(preedit.prefix(cursor)))
+        return GhostAnchor(x: x, line: first, font: font)
     }
 
     /// docs/spec/keys-and-composition.md §9.4: with nothing marked, most clients give the insertion point's rectangle for index 0 (not measured; the
@@ -204,6 +209,7 @@ final class ClientAdapter: TextClient {
     /// whose own class has neither method, while `-class` reports the wrapper it forwards to.
     var appearance: NSAppearance? {
         guard let client = controller?.client() as? NSObject else { return nil }
+        ApplePanelAdapter.hostBundle = (client as? IMKTextInput)?.bundleIdentifier()
         let cls: AnyClass = type(of: client)
         for name in ["viewEffectiveAppearance", "windowEffectiveAppearance"] {
             let sel = NSSelectorFromString(name)

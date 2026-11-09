@@ -19,6 +19,7 @@ final class AppleListView: NSView {
     var total = 0
     var numbered = true
     var onClick: ((Int) -> Void)?
+    var accent: NSColor = .controlAccentColor
 
     override var isFlipped: Bool { true }
 
@@ -43,8 +44,7 @@ final class AppleListView: NSView {
         bounds.fill()
         let pad = Self.pad
         let rightInset: CGFloat = needsScroller ? Self.scrollerInset : 0
-        let accent = NSColor.controlAccentColor
-        for i in items.indices {
+                for i in items.indices {
             let y = pad + CGFloat(i) * Self.rowH
             let rect = NSRect(x: pad, y: y, width: bounds.width - 2 * pad - rightInset, height: Self.rowH)
             let isSel = i == selected
@@ -94,6 +94,21 @@ final class AppleListView: NSView {
 
 @MainActor
 final class ApplePanelAdapter: CandidatePanel {
+    /// Bundle id of the app being typed into; its own accent colour (NSAccentColorName, e.g. Notes yellow, Excel green) tints the selected row.
+    static var hostBundle: String?
+    private static var accentCache: [String: NSColor?] = [:]
+    static func hostAccent() -> NSColor {
+        guard let id = hostBundle else { return .controlAccentColor }
+        if let c = accentCache[id] { return c ?? .controlAccentColor }
+        var found: NSColor?
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id), let b = Bundle(url: url),
+           let name = b.object(forInfoDictionaryKey: "NSAccentColorName") as? String {
+            found = NSColor(named: NSColor.Name(name), bundle: b)
+        }
+        accentCache[id] = found
+        return found ?? .controlAccentColor
+    }
+
     var onSelect: ((Int) -> Void)?
     private let window: PanelWindow
     private let effect = NSVisualEffectView()
@@ -139,7 +154,7 @@ final class ApplePanelAdapter: CandidatePanel {
         ghostLabel.isBezeled = false
         ghostLabel.drawsBackground = false
         ghostLabel.isEditable = false
-        ghostLabel.textColor = NSColor.labelColor.withAlphaComponent(0.4)
+        ghostLabel.textColor = NSColor(white: 0.5, alpha: 0.75)
         ghostWindow.contentView = ghostLabel
         list.onClick = { [weak self] i in self?.onSelect?(i) }
     }
@@ -158,6 +173,7 @@ final class ApplePanelAdapter: CandidatePanel {
     private func render(_ items: [String], notes: [String?], selected: Int, first: Int, total: Int, numbered: Bool,
                         lineRect: NSRect?, appearance: NSAppearance?) {
         if window.appearance?.name != appearance?.name { window.appearance = appearance }
+        list.accent = Self.hostAccent()
         list.items = items
         list.notes = notes
         list.selected = selected
@@ -201,8 +217,9 @@ final class ApplePanelAdapter: CandidatePanel {
         let lw = ghostLabel.frame.width
         let lh = ghostLabel.frame.height
         let h = max(line.height, lh)
-        let frame = NSRect(x: anchor.x, y: line.minY + (line.height - h) / 2, width: lw + 2, height: h)
-        ghostLabel.frame = NSRect(x: 0, y: (h - lh) / 2, width: lw, height: lh)
+        // Bottom-aligned to the client's line rectangle: browsers report a taller line than the glyphs and sit the text low in it.
+        let frame = NSRect(x: anchor.x, y: line.minY - lh * 0.04, width: lw + 2, height: h)
+        ghostLabel.frame = NSRect(x: 0, y: 0, width: lw, height: lh)
         ghostWindow.setFrame(frame, display: true)
         ghostWindow.contentView = ghostLabel
         if !ghostWindow.isVisible { ghostWindow.orderFrontRegardless() }

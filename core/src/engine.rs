@@ -1546,7 +1546,8 @@ impl Engine {
             return;
         }
         let new_on = self.newword && !self.paused;
-        if !(new_on && self.learner.has_new_words()) && self.fixed.iter().all(|f| f.pre.is_none() && f.displaced_new.is_empty()) {
+        let typed = if new_on { self.typed_words() } else { Vec::new() };
+        if typed.is_empty() && !(new_on && self.learner.has_new_words()) && self.fixed.iter().all(|f| f.pre.is_none() && f.displaced_new.is_empty()) {
             return;
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -1596,7 +1597,12 @@ impl Engine {
             // New-word B: learn (docs/spec/learning.md §8.2), halve what re-picks displaced and count the uses (docs/spec/learning.md §8.5, once a day).
             let halves: Vec<(Vec<String>, String)> =
                 if self.newword { self.fixed.iter().flat_map(|f| f.displaced_new.clone()).collect() } else { Vec::new() };
-            let learns = if new_on { self.new_word_spans() } else { Vec::new() };
+            let mut learns = if new_on { self.new_word_spans() } else { Vec::new() };
+            for x in &typed {
+                if !learns.contains(x) {
+                    learns.push(x.clone());
+                }
+            }
             for (reading, word) in &learns {
                 touched.push(self.learner.learn_new(reading, word, today));
             }
@@ -1703,6 +1709,40 @@ impl Engine {
             .filter(|(_, _, r, w)| self.learner.new_word_day(r, w).is_some_and(|d| d != today))
             .map(|(_, _, r, w)| (r, w))
             .collect()
+    }
+
+    /// Personal fork: the 3 to 4 character words on the path at commit that no record covers yet (a name typed straight and decoded right), so
+    /// the prediction row can lead with them next time.
+    fn typed_words(&self) -> Vec<(Vec<String>, String)> {
+        let mut out = Vec::new();
+        let toks: Vec<(usize, &str, usize)> = self.path.iter().zip(self.path_starts()).map(|(p, s)| (s, p.word.as_str(), p.syllables)).collect();
+        let ok = |t: &(usize, &str, usize)| t.1.chars().count() == t.2 && t.1.chars().all(|c| is_han(c) && !NEWWORD_BREAK.contains(c)) && t.0 + t.2 <= self.syls.len();
+        for i in 0..toks.len() {
+            let (mut chars, mut single) = (0usize, false);
+            let mut text = String::new();
+            for t in &toks[i..] {
+                if !ok(t) || self.is_punct(t.0) {
+                    break;
+                }
+                chars += t.2;
+                single |= t.2 == 1;
+                text.push_str(t.1);
+                if chars > NEWWORD_MAX {
+                    break;
+                }
+                let whole_token = i == toks.len() || std::ptr::eq(t, &toks[i]);
+                // One lexicon-length word, or a run of tokens (a name the lexicon splits as surname + given name).
+                if chars >= 3 && (whole_token || single) {
+                    let reading = &self.syls[toks[i].0..toks[i].0 + chars];
+                    if (whole_token || !self.in_lexicon(reading, &text)) && self.learner.new_word_day(reading, &text).is_none() {
+                        out.push((reading.to_vec(), text.clone()));
+                    }
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        out.retain(|x| seen.insert(x.clone()));
+        out
     }
 
     /// The path's tokens that are new words: (start, end, reading, word), with a record and not in the lexicon.
@@ -2708,7 +2748,7 @@ impl Engine {
                 (_, _, _, Some((f, w))) => predict_english(idx, &st.lm, f, w, cfg, v, &units, mode, limit).into_iter().map(|(w, _, r)| (w, r)).collect(),
                 _ => predict(idx, &st.lm, cfg, v, &units, mode, limit).into_iter().map(|(w, _, _, r)| (w, r)).collect(),
             };
-            hits.into_iter()
+            let mut found: Vec<Pred> = hits.into_iter()
                 .enumerate()
                 .filter_map(|(i, (word, reading))| {
                     // Step 2: keep the slice-1 window and anything learned; the index counts before step 3 filters.
@@ -2716,7 +2756,19 @@ impl Engine {
                     (i < PREDICT_MAX || weight > 0.0).then_some(Pred { word, reading, start: s, key: key.clone(), weight })
                 })
                 .filter(|p| p.word != shown)
-                .collect()
+                .collect();
+            // Personal fork: learned new words (a name the user spelled out by re-picking) whose reading starts with what is typed lead the row.
+            if learned && units.len() >= 2 {
+                for r in self.learner.records().iter().filter(|r| r.context == NEWWORD && reading_matches_in(&units, &r.reading, mode)) {
+                    if r.word == shown || found.iter().any(|p| p.word == r.word) {
+                        continue;
+                    }
+                    if let Some(w) = self.learner.new_word_weight(&r.reading, &r.word, today).filter(|&w| w >= 0.5) {
+                        found.push(Pred { word: r.word.clone(), reading: r.reading.clone(), start: s, key: key.clone(), weight: w });
+                    }
+                }
+            }
+            found
         };
         // Path starts are strictly increasing (every token is at least one position wide), so no start repeats.
         let mut long: Vec<Pred> = long_starts.into_iter().flat_map(&query).collect();
@@ -2749,10 +2801,10 @@ impl Engine {
     /// counts 0 (docs/spec/learning.md §5.3: it never overrides what the model is sure of).
     fn learned_weight(&self, key: &str, next: Option<&str>, reading: &[String], word: &str, today: i64) -> f64 {
         let key = record_key(key.to_string(), next);
-        match self.learner.lookup(&key, reading, today) {
-            (Level::Global, _) => 0.0,
-            (_, hits) => hits.iter().find(|h| h.0 == word).map_or(0.0, |h| h.1),
-        }
+        // Personal fork: the global level counts too, so a word the user picked in another context (their own name) still leads the row.
+        let (_, hits) = self.learner.lookup(&key, reading, today);
+        let _ = Level::Global;
+        hits.iter().find(|h| h.0 == word).map_or(0.0, |h| h.1)
     }
 
     /// docs/spec/prediction.md §3.4: replace `syls[start..cursor]` by the item's reading, fix the word over it, move the cursor behind

@@ -2055,6 +2055,9 @@ public final class Session {
                 } else if let g = ghostWanted, let anchor = client.ghostAnchor(cursor: cursor, preedit: o.preedit) {
                     shell.ghostIndex = g.index
                     shell.showGhost(g.text, anchor: anchor, appearance: client.appearance)
+                } else if shell.ghostOn && o.selected == -1 && !o.preedit.isEmpty {
+                    // Ghost mode: a passive prediction row with nothing usable to show as ghost text stays hidden.
+                    shell.hideCandidates()
                 } else {
                     shell.showCandidates(o.candidates, selected: o.selected, columns: o.columns, first: o.first, total: o.total,
                                          vertical: o.vertical, lineRect: rect, appearance: client.appearance)
@@ -2072,6 +2075,12 @@ public final class Session {
         for (i, c) in candidates.enumerated() {
             var k = c.count
             while k > 0, !typed.hasSuffix(String(c.prefix(k))) { k -= 1 }
+            // A word sharing nothing with the typed text (來勢洶洶 after 來試) is another reading, not a continuation.
+            // Its extra characters still predict what follows (來勢洶洶 after 來試 shows the whole word); Tab then takes it.
+            if k == 0, !typed.isEmpty {
+                if c.count > typed.count { return (i, c) }
+                continue
+            }
             let rest = String(c.dropFirst(k))
             if !rest.isEmpty { return (i, rest) }
         }
