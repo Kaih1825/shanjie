@@ -208,6 +208,7 @@ cp data/packs/beauty-add.tsv data/packs/beauty-sources.tsv data/packs/beauty.jso
 while IFS=$'\t' read -r mf _; do cp -L "data/lm/$mf" "$RES/"; done < data/models.tsv   # -L: the worktree's model may be a symlink; models.tsv is the one list
 cp data/models.tsv "$RES/"
 swift scripts/make-icon.swift "$RES/shanjie.tiff"
+sips -s format png "$RES/shanjie.tiff" --out "$RES/shanjie.png" >/dev/null
 scripts/compile-app-icon.sh "$RES"   # the app icon (docs/spec/macos-shell.md §1.4): Assets.car and AppIcon.icns
 cp "$RES/AppIcon.icns" "$HELPER/Contents/Resources/"   # the helper's Dock icon while it runs
 cat > "$HELPER/Contents/Info.plist" <<EOF
@@ -229,7 +230,7 @@ cat > "$HELPER/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>
@@ -347,13 +348,15 @@ mode() {
       <key>$1</key>
       <dict>
         <key>TISIntendedLanguage</key><string>zh-Hant</string>
+        <key>TISInputSourceID</key><string>$1</string>
+        <key>TISIconLabels</key><dict><key>Primary</key><string>善解</string></dict>
         <key>TISIconIsTemplate</key><true/>
-        <key>tsInputModeAlternateMenuIconFileKey</key><string>shanjie.tiff</string>
+        <key>tsInputModeAlternateMenuIconFileKey</key><string>shanjie.png</string>
         <key>tsInputModeCharacterRepertoireKey</key><array><string>Hant</string><string>Han</string></array>
         <key>tsInputModeDefaultStateKey</key><true/>
         <key>tsInputModeIsVisibleKey</key><true/>
-        <key>tsInputModeMenuIconFileKey</key><string>shanjie.tiff</string>
-        <key>tsInputModePaletteIconFileKey</key><string>shanjie.tiff</string>
+        <key>tsInputModeMenuIconFileKey</key><string>shanjie.png</string>
+        <key>tsInputModePaletteIconFileKey</key><string>shanjie.png</string>
         <key>tsInputModePrimaryInScriptKey</key><true/>
         <key>tsInputModeScriptKey</key><string>smTradChinese</string>
       </dict>
@@ -378,7 +381,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key><string>26.0</string>
+  <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>LSUIElement</key><true/>
   <key>LSHasLocalizedDisplayName</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -401,7 +404,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>SUEnableInstallerLauncherService</key><false/>
   <key>SUEnableSystemProfiling</key><false/>
   <key>tsInputMethodCharacterRepertoireKey</key><array><string>Hant</string></array>
-  <key>tsInputMethodIconFileKey</key><string>shanjie.tiff</string>
+  <key>tsInputMethodIconFileKey</key><string>shanjie.png</string>
   <key>ComponentInputModeDict</key>
   <dict>
     <key>tsInputModeListKey</key>

@@ -11,7 +11,7 @@ let libcore = repoRoot + "/target/release/libcore.a"
 
 let package = Package(
     name: "Shanjie",
-    platforms: [.macOS("26.0")],
+    platforms: [.macOS("15.0")],
     // The first external dependency (docs/spec/install-and-update.md §2.2, §3.7, §7.2–§7.4): Sparkle, pinned exactly. 2.9.0 added signed
     // feeds, 2.9.2 fixed two security issues and 2.9.5 and 2.9.6 three more (2.10.0: docs/spec/install-and-update.md
     // §2.2–§2.4, where a sandboxed input method drives Sparkle's installer outside the sandbox). The official prebuilt framework, whose binary is pinned by the checksum in

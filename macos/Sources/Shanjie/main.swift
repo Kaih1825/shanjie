@@ -280,7 +280,7 @@ func runServer() -> Never {
     }
     // docs/spec/macos-shell.md §2.2: the engine is built after the IMK server exists.
     App.shell = Shell(
-        resources: resources.absoluteURL, panel: CandidatePanelAdapter(),
+        resources: resources.absoluteURL, panel: ApplePanelAdapter(),
         isSecureInput: { IsSecureEventInputEnabled() }, layoutStore: DefaultsLayoutStore(),
         learningDirectory: Shell.learningURL(), dialogs: AlertDialogs(), demoteStore: DefaultsDemoteStore(), predictionStore: DefaultsPredictionStore(), abbreviationStore: DefaultsAbbreviationStore(), englishStore: DefaultsEnglishStore(), acgPackStore: DefaultsAcgPackStore(), quotePackStore: DefaultsQuotePackStore(),
         glassTintStore: DefaultsGlassTintStore(), candidateOrientationStore: DefaultsCandidateOrientationStore(),

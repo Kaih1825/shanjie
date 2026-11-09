@@ -25,6 +25,7 @@ public protocol TextClient: AnyObject {
     /// client reports none.
     /// `cursor`: the composition cursor in UTF-16 units within the marked text.
     func lineRect(cursor: Int) -> NSRect?
+    func ghostAnchor(cursor: Int, preedit: String) -> GhostAnchor?
     /// docs/spec/keys-and-composition.md §9.4: the insertion point's line rectangle when nothing is marked (`attributes(forCharacterIndex: 0,
     /// lineHeightRectangle:)` in the app), `nil` if the client reports none.
     func caretRect() -> NSRect?
@@ -32,7 +33,16 @@ public protocol TextClient: AnyObject {
     var appearance: NSAppearance? { get }
 }
 
+/// Where the ghost text starts (screen x), the line's rectangle, and the font the client draws its text with.
+public struct GhostAnchor {
+    public var x: CGFloat
+    public var line: NSRect
+    public var font: NSFont?
+    public init(x: CGFloat, line: NSRect, font: NSFont?) { self.x = x; self.line = line; self.font = font }
+}
+
 extension TextClient {
+    public func ghostAnchor(cursor: Int, preedit: String) -> GhostAnchor? { nil }
     /// A client that cannot tell shows no hint.
     public func caretRect() -> NSRect? { nil }
 }
@@ -108,10 +118,18 @@ public protocol CandidatePanel: AnyObject {
     /// like any other content.
     func showHint(_ text: String, vertical: Int, lineRect: NSRect?, appearance: NSAppearance?, glassTint: Double)
     func hide()
+    /// Local change: the first prediction drawn as semi-transparent text after the composition (Tab accepts it), instead of a row.
+    func showGhost(_ text: String, anchor: GhostAnchor, appearance: NSAppearance?)
+    func hideGhost()
     /// Re-applies the tint to what is on screen now, without a new `show` (the slider moved while the panel is up).
     func setGlassTint(_ glassTint: Double)
     /// A mouse click on a cell, by position in what `show` last received.
     var onSelect: ((Int) -> Void)? { get set }
+}
+
+public extension CandidatePanel {
+    func showGhost(_ text: String, anchor: GhostAnchor, appearance: NSAppearance?) {}
+    func hideGhost() {}
 }
 
 /// The keyboard layout. Since docs/spec/macos-shell.md §7 it is chosen in the input
@@ -900,19 +918,19 @@ public final class Shell {
         self.spacingStore = spacingStore
         spacingOn = spacingStore.spacing == true
         self.englishStore = englishStore
-        englishOn = englishStore.english ?? true // docs/spec/english-mixed.md §1.1, §11: on unless the person turned it off (a saved value wins)
+        englishOn = englishStore.english ?? false // docs/spec/english-mixed.md §1.1, §11: on unless the person turned it off (a saved value wins)
         englishOverwriteOn = englishStore.englishOverwrite ?? false // docs/spec/english-mixed.md §10.1: was true
         englishKeyOrderOn = englishStore.englishKeyOrder ?? true // zhen-revert: was false; a saved false stays false
         englishReversalGuardOn = englishStore.englishReversalGuard ?? true
         self.fuzzyStore = fuzzyStore
-        fuzzyFlags = (fuzzyStore.fuzzyFlags ?? 0) & 0b11111
+        fuzzyFlags = (fuzzyStore.fuzzyFlags ?? 0b1110000) & 0b1111111
         self.acgPackStore = acgPackStore
         acgDataDate = Shell.readAcgDataDate(resources.appendingPathComponent("packs/acg.json"))
         self.quotePackStore = quotePackStore
         self.glassTintStore = glassTintStore
         glassTint = glassTintStore.glassTint ?? 0
         self.candidateOrientationStore = candidateOrientationStore
-        candidateVertical = candidateOrientationStore.candidateVertical ?? false
+        candidateVertical = candidateOrientationStore.candidateVertical ?? true
         self.rerankStore = rerankStore
         rerankOn = rerankStore.rerank ?? true
         rerankLevel = rerankStore.rerankLevel.flatMap(RerankLevel.init(rawValue:)) ?? .standard
@@ -1131,7 +1149,7 @@ public final class Shell {
     /// The settings window's 模糊輸入 flags (docs/spec/decoder.md §6.1): stored, and sent to the engine, which recomputes the composition
     /// (an accepted syllable keeps decoding whatever the flags are); the snapshot is for the caller to show.
     func setFuzzy(_ flags: UInt32) -> CoreResult? {
-        fuzzyFlags = flags & 0b11111
+        fuzzyFlags = flags & 0b1111111
         fuzzyStore.fuzzyFlags = fuzzyFlags
         defer { changed() }
         return engine?.setFuzzy(fuzzyFlags)
@@ -1481,6 +1499,7 @@ public final class Shell {
         shownVertical = vertical
         candidateSelected = selected
         hintShown = false
+        ghostShown = false
         panel.show(list, notes: notes, selected: selected, columns: columns, first: first, total: total, vertical: vertical,
                    lineRect: lineRect, appearance: appearance, glassTint: glassTint)
     }
@@ -1497,7 +1516,28 @@ public final class Shell {
         panel.showHint(Self.englishRunHint, vertical: shownVertical, lineRect: lineRect, appearance: appearance, glassTint: glassTint)
     }
 
+    /// Local change: whether the best prediction is drawn as ghost text (default on, key `ghostPrediction`), and whether it is on screen now.
+    var ghostOn: Bool {
+        get { UserDefaults.standard.object(forKey: "ghostPrediction") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "ghostPrediction") }
+    }
+    var ghostShown = false
+    /// Experimental: put the ghost into the marked text instead of a floating window (off: many clients ignore the colour).
+    var ghostInline: Bool { UserDefaults.standard.object(forKey: "ghostInline") as? Bool ?? false }
+    var ghostIndex = 0
+
+    func showGhost(_ text: String, anchor: GhostAnchor, appearance: NSAppearance?) {
+        hintAnchor = nil
+        hintShown = false
+        shownVertical = 0
+        candidateSelected = -1
+        ghostShown = true
+        panel.showGhost(text, anchor: anchor, appearance: appearance)
+    }
+
     func hideCandidates() {
+        ghostShown = false
+        panel.hideGhost()
         lineCache = nil
         hintAnchor = nil
         hintShown = false
@@ -1552,6 +1592,11 @@ public final class Session {
         guard shell.engine != nil else { return false }
         if let event, event.type == .flagsChanged { return handleFlags(event) }
         guard event == nil || event?.type == .keyDown else { return false }
+        // Local change: Tab takes the ghost prediction (the first one), as in VS Code.
+        if let event, shell.ghostShown, shell.owner === self, event.keyCode == 48,
+           event.modifierFlags.intersection([.shift, .control, .option, .command, .capsLock]).isEmpty {
+            if candidateSelected(at: shell.ghostIndex) { return true }
+        }
         // docs/spec/english-mixed.md §10.3: the key is handled as usual first; the window (when armed) shows after it.
         defer { shell.showEnglishNoticeIfArmed(caret: currentLineRect()) }
         shell.shiftTap.keyDown()  // docs/spec/keys-and-composition.md §9.1: a key between Shift's press and release spoils the tap
@@ -1961,12 +2006,16 @@ public final class Session {
             spacingPrev = text.last
             client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
         }
+        // Local change: the best prediction goes into the marked text after the caret, in a faint colour, so the client lays it out itself.
+        let ghostWanted: (index: Int, text: String)? = shell.ghostOn && o.selected == -1 && !o.preedit.isEmpty && !hidesFirstSyllableRow(o)
+            ? Self.ghostChoice(candidates: o.candidates, preedit: o.preedit) : nil
+        let ghost = shell.ghostInline ? ghostWanted : nil
         if !o.preedit.isEmpty {
             // docs/spec/macos-shell.md §4: an unchanged composition (Tab into the prediction row) is not sent again. Chromium hands the key
             // to the page before the composition, so a page that moves focus on the key would get the text a second time.
-            let marked = Marked(text: o.preedit, cursor: o.cursorUTF16, runStart: o.englishRunStart, runLength: o.englishRunLength)
+            let marked = Marked(text: o.preedit, cursor: o.cursorUTF16, runStart: o.englishRunStart, runLength: o.englishRunLength, ghost: ghost?.text ?? "")
             if marked != sentMarked || !o.commit.isEmpty {
-                client.setMarkedText(Self.marked(o), selectionRange: NSRange(location: o.cursorUTF16, length: 0))
+                client.setMarkedText(Self.marked(o, ghost: ghost?.text), selectionRange: NSRange(location: o.cursorUTF16, length: 0))
                 sentMarked = marked
             }
         } else if shell.composing {
@@ -1999,11 +2048,34 @@ public final class Session {
                     rect = client.lineRect(cursor: cursor)
                     shell.lineCache = (o.preedit, cursor, rect)
                 }
-                shell.showCandidates(o.candidates, selected: o.selected, columns: o.columns, first: o.first, total: o.total,
-                                     vertical: o.vertical, lineRect: rect, appearance: client.appearance)
+                if let g = ghost {
+                    shell.hideCandidates()
+                    shell.ghostShown = true
+                    shell.ghostIndex = g.index
+                } else if let g = ghostWanted, let anchor = client.ghostAnchor(cursor: cursor, preedit: o.preedit) {
+                    shell.ghostIndex = g.index
+                    shell.showGhost(g.text, anchor: anchor, appearance: client.appearance)
+                } else {
+                    shell.showCandidates(o.candidates, selected: o.selected, columns: o.columns, first: o.first, total: o.total,
+                                         vertical: o.vertical, lineRect: rect, appearance: client.appearance)
+                }
             }
         }
         takeRerank()
+    }
+
+    /// The first prediction that adds something after the composition: the part of the word the preedit does not already end with.
+    static func ghostChoice(candidates: [String], preedit: String) -> (index: Int, text: String)? {
+        // The typed part may end in an unfinished syllable (zhuyin symbols and tone marks); the word's first characters are the text before it.
+        var typed = Substring(preedit)
+        while let l = typed.last, (0x3105...0x312F).contains(l.unicodeScalars.first!.value) || "ˊˇˋ˙".contains(l) { typed = typed.dropLast() }
+        for (i, c) in candidates.enumerated() {
+            var k = c.count
+            while k > 0, !typed.hasSuffix(String(c.prefix(k))) { k -= 1 }
+            let rest = String(c.dropFirst(k))
+            if !rest.isEmpty { return (i, rest) }
+        }
+        return nil
     }
 
     /// docs/spec/prediction.md §9.2, §9.4: a passive prediction row for the first syllable, in a browser, is not shown.
@@ -2014,13 +2086,19 @@ public final class Session {
 
     /// docs/spec/macos-shell.md §4 and docs/spec/english-mixed.md §4.6: the preedit with a single underline, and a thick one over the open English run
     /// (clamped to the text, so a wrong range from the core can never throw).
-    static func marked(_ o: CoreOutput) -> NSAttributedString {
+    static func marked(_ o: CoreOutput, ghost: String? = nil) -> NSAttributedString {
         let text = NSMutableAttributedString(
             string: o.preedit, attributes: [.underlineStyle: NSUnderlineStyle.single.rawValue])
         let run = NSRange(location: o.englishRunStart, length: o.englishRunLength)
         let range = NSIntersectionRange(run, NSRange(location: 0, length: text.length))
         if range.length > 0 {
             text.addAttribute(.underlineStyle, value: NSUnderlineStyle.thick.rawValue, range: range)
+        }
+        if let ghost, !ghost.isEmpty {
+            text.append(NSAttributedString(string: ghost, attributes: [
+                .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.6),
+                .underlineStyle: NSUnderlineStyle().rawValue,
+            ]))
         }
         return text
     }
@@ -2045,6 +2123,6 @@ public final class Session {
     }
 
     /// docs/spec/macos-shell.md §4: the marked text this session last sent to its client (nil after clearing it).
-    private struct Marked: Equatable { let text: String; let cursor: Int; let runStart: Int; let runLength: Int }
+    private struct Marked: Equatable { let text: String; let cursor: Int; let runStart: Int; let runLength: Int; let ghost: String }
     private var sentMarked: Marked?
 }

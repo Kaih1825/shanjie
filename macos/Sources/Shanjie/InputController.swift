@@ -152,6 +152,39 @@ final class ClientAdapter: TextClient {
         return rect.origin == .zero ? nil : rect
     }
 
+    /// Local change: where the marked text ends and the size of the text, for the ghost prediction. Measured on Electron: the client
+    /// answers every index with the START of the marked text (x does not move as it grows), nothing for the end, a reliable line
+    /// height (font size = height / 1.178 for PingFang), and an unreliable font. So the end is the start plus the measured width of the
+    /// preedit; a client that does answer per character (x grows with the index) gives the last character's left edge plus one em.
+    func ghostAnchor(cursor: Int, preedit: String) -> GhostAnchor? {
+        guard let client else { return nil }
+        let marked = client.markedRange()
+        guard marked.location != NSNotFound, marked.length > 0 else { return nil }
+        func rect(at index: Int) -> NSRect? {
+            var r = NSRect(x: 0, y: 0, width: 16, height: 16)
+            var i = index
+            while r.origin.x == 0, r.origin.y == 0, i >= 0 {
+                _ = client.attributes(forCharacterIndex: i, lineHeightRectangle: &r)
+                i -= 1
+            }
+            return r.origin == .zero ? nil : r
+        }
+        let lastIndex = min(max(cursor - 1, 0), marked.length - 1)
+        guard let last = rect(at: lastIndex) else { return nil }
+        let size = max(10, last.height / 1.178)
+        let font = NSFont.systemFont(ofSize: size)
+        func width(_ s: String) -> CGFloat { NSAttributedString(string: s, attributes: [.font: font]).size().width }
+        let first = rect(at: 0) ?? last
+        var x: CGFloat
+        if lastIndex > 0, abs(last.minX - first.minX) > 1, abs(last.minY - first.minY) < last.height / 2 {
+            let ch = String(preedit.dropFirst(max(lastIndex, 0)).prefix(1))
+            x = last.minX + width(ch.isEmpty ? "　" : ch)
+        } else {
+            x = first.minX + width(String(preedit.prefix(cursor)))
+        }
+        return GhostAnchor(x: x, line: last, font: font)
+    }
+
     /// docs/spec/keys-and-composition.md §9.4: with nothing marked, most clients give the insertion point's rectangle for index 0 (not measured; the
     /// device check decides). The zero origin they leave untouched when they have none is "no rectangle".
     func caretRect() -> NSRect? {
@@ -200,7 +233,7 @@ final class ShiftHintAdapter: ShiftHintPanel {
     private static let fontSize: CGFloat = 16
     private static let sidePadding: CGFloat = 10
     private let window = PanelWindow(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
-    private let glass = NSGlassEffectView()
+    private let glass = GlassView()
     private let label = NSTextField(labelWithString: "")
     private var tintApplier = GlassTint.Applier()
     private var fade: DispatchWorkItem?
@@ -319,7 +352,7 @@ enum Metrics {
     static let collapseDuration: TimeInterval = 0.25
 }
 
-extension NSGlassEffectView {
+extension GlassView {
     /// Assigns what `GlassTint.Applier` decided: a colour, nil to remove, or nothing.
     func apply(_ change: GlassTint.Change?) {
         switch change {
@@ -335,7 +368,7 @@ extension NSGlassEffectView {
 /// (`GlassTint.Applier`) as the real panel's collapsed bar. The real bar's expand chevron is left out
 /// (the sample has nothing to expand). It follows its own effective appearance.
 @MainActor
-final class SampleCandidateBar: NSGlassEffectView {
+final class SampleCandidateBar: GlassView {
     private var applier = GlassTint.Applier()
     private var value = 0.0
     private let size: NSSize
@@ -385,7 +418,7 @@ private final class GridView: NSView {
 final class CandidatePanelAdapter: CandidatePanel {
     var onSelect: ((Int) -> Void)?
     private let window: PanelWindow
-    private let glass = NSGlassEffectView()
+    private let glass = GlassView()
     private var tintApplier = GlassTint.Applier()
     /// The glass's one content view, kept for the panel's lifetime: replacing the glass's content,
     /// resizing or re-ordering the window on every selection move made the glass's glow flicker.
@@ -777,7 +810,7 @@ final class CandidatePanelAdapter: CandidatePanel {
     }
 
     /// docs/spec/macos-shell.md §8.7, on every show and including no tint, so going back to 0 removes it.
-    /// `NSGlassEffectView.tintColor` (AppKit/NSGlassEffectView.h line 34, SDK 27.0 as measured, available
+    /// `GlassView.tintColor` (AppKit/GlassView.h line 34, SDK 27.0 as measured, available
     /// since macOS 26.0: "The color the glass effect view uses to tint the background and glass effect
     /// toward"). `tintApplier` decides what to assign (nothing when unchanged, nil to clear); with 0 and
     /// never tinted nothing is assigned, so the default look stays bit-identical. Its effect on macOS 26

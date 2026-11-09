@@ -19,6 +19,7 @@ public final class SettingsModel: ObservableObject {
 
     @Published public private(set) var layout = InputMode.standard
     @Published public private(set) var prediction = true
+    @Published public private(set) var ghost = true
     /// 在瀏覽器裡，第一個字不顯示預測 (docs/spec/prediction.md §9.4), greyed while the prediction row is off.
     @Published public private(set) var browserFirstSyllable = true
     @Published public private(set) var abbreviation = false
@@ -101,6 +102,7 @@ public final class SettingsModel: ObservableObject {
     func refreshSettings() {
         layout = shell.layout
         prediction = shell.predictionOn
+        ghost = shell.ghostOn
         browserFirstSyllable = shell.browserFirstSyllableOn
         abbreviation = shell.abbreviationOn
         spacing = shell.spacingOn
@@ -143,6 +145,7 @@ public final class SettingsModel: ObservableObject {
     public func setAbbreviation(_ on: Bool) { shell.applyAbbreviation(on) }
     public func setSpacing(_ on: Bool) { shell.setSpacing(on) }
     public func setBrowserFirstSyllable(_ on: Bool) { shell.setBrowserFirstSyllable(on) }
+    public func setGhost(_ on: Bool) { shell.ghostOn = on; ghost = on; shell.hideCandidates() }
     public func setEnglish(_ on: Bool) { shell.applyEnglish(on) }
     /// One checkbox of 模糊輸入: `bit` is a bit of the flags (0-3 the pairs, 4 the adjacent-key slips).
     public func setFuzzy(bit: Int, _ on: Bool) {

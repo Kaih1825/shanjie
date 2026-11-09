@@ -13,7 +13,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Bits of the fuzzy flags (`shanjie_engine_set_fuzzy`, `--fuzzy`): 0-3 the sound pairs, 4 adjacent-key slips.
 pub const FUZZY_PAIRS: [(char, char); 4] = [('ㄣ', 'ㄥ'), ('ㄓ', 'ㄗ'), ('ㄔ', 'ㄘ'), ('ㄕ', 'ㄙ')];
-pub const FUZZY_SOUND: u32 = 0b1111;
+/// Local change: bit 5 merges the common typing confusions (aspirated/unaspirated initials, ㄓㄔㄗㄘ, ㄕㄙ, ㄌㄋ, ㄈㄏ, finals ㄣㄥ and ㄢㄤ,
+/// and every tone) into one class, so a mistyped syllable still finds its word.
+pub const FUZZY_WIDE: u32 = 1 << 5;
+/// Local change: bit 6 = the intended syllable is one key-slip away (up/down/left/right neighbour of any key, tone keys included)
+/// from the syllable that was typed, even when the typed syllable is itself a legal reading.
+pub const FUZZY_KEYS: u32 = 1 << 6;
+pub const FUZZY_PAIR_BITS: u32 = 0b1111;
+pub const FUZZY_SOUND: u32 = FUZZY_PAIR_BITS | FUZZY_WIDE | FUZZY_KEYS;
 pub const FUZZY_ADJACENT: u32 = 1 << 4;
 pub const FUZZY_ALL: u32 = FUZZY_SOUND | FUZZY_ADJACENT;
 /// Score taken off a word read through one tolerant syllable (log10, as the demotion deltas). The sound pairs' value is 2.5, the
@@ -71,6 +78,61 @@ fn normal(syl: &str, pairs: u32) -> String {
         .collect()
 }
 
+/// Wide merge: every confusable symbol maps to its class head and tone marks are dropped.
+fn normal_wide(syl: &str) -> String {
+    syl.chars()
+        .filter(|c| !matches!(c, 'ˊ' | 'ˇ' | 'ˋ' | '˙'))
+        .map(|c| match c {
+            'ㄆ' => 'ㄅ',
+            'ㄊ' => 'ㄉ',
+            'ㄎ' => 'ㄍ',
+            'ㄑ' => 'ㄐ',
+            'ㄔ' | 'ㄗ' | 'ㄘ' => 'ㄓ',
+            'ㄙ' => 'ㄕ',
+            'ㄋ' => 'ㄌ',
+            'ㄏ' => 'ㄈ',
+            'ㄥ' => 'ㄣ',
+            'ㄤ' => 'ㄢ',
+            o => o,
+        })
+        .collect()
+}
+
+/// Tone mark <-> key of the standard layout (the first tone is no key).
+const TONE_KEYS: [(char, char); 4] = [('ˇ', '3'), ('ˋ', '4'), ('ˊ', '6'), ('˙', '7')];
+
+/// Every reading that one slip to a neighbouring key (left/right in the row, same column up/down) would show for the lexicon syllable `syl`.
+fn key_slips(syl: &str) -> Vec<String> {
+    let mut keys: Vec<char> = Vec::new();
+    for c in syl.chars() {
+        if let Some(k) = Layout::Standard.key_of_symbol(c) { keys.push(k) } else if let Some(&(_, k)) = TONE_KEYS.iter().find(|t| t.0 == c) { keys.push(k) }
+    }
+    let rows: Vec<Vec<char>> = ROWS.iter().map(|r| r.chars().collect()).collect();
+    let mut out = Vec::new();
+    for i in 0..keys.len() {
+        let Some((r, c)) = rows.iter().enumerate().find_map(|(r, row)| row.iter().position(|&x| x == keys[i]).map(|c| (r, c))) else { continue };
+        let mut near: Vec<char> = Vec::new();
+        if c > 0 { near.push(rows[r][c - 1]) }
+        if c + 1 < rows[r].len() { near.push(rows[r][c + 1]) }
+        if r > 0 { if let Some(&k) = rows[r - 1].get(c) { near.push(k) } }
+        if r + 1 < rows.len() { if let Some(&k) = rows[r + 1].get(c) { near.push(k) } }
+        for nk in near {
+            let mut k2 = keys.clone();
+            k2[i] = nk;
+            // compose: symbols fill their columns, a tone key sets the tone, the last tone key wins
+            let mut cols = [None; 3];
+            let mut tone = String::new();
+            for &kk in &k2 {
+                if let Some(&(m, _)) = TONE_KEYS.iter().find(|t| t.1 == kk) { tone = m.to_string(); continue }
+                if let Some(sy) = Layout::Standard.symbol_of(kk).map(|x| x.1) { cols[column(sy)] = Some(sy) }
+            }
+            let shown: String = cols.iter().flatten().collect::<String>() + &tone;
+            if shown != syl && !shown.is_empty() { out.push(shown) }
+        }
+    }
+    out
+}
+
 /// The two tables. Syllables are the lexicon's interned ids.
 pub struct Tolerance {
     /// Index = the enabled pairs (1..=15): syllable id -> the other syllables that read the same, sorted by name. Only syllables
@@ -89,10 +151,43 @@ impl Tolerance {
             v.into_boxed_slice()
         };
         let mut sound = vec![HashMap::new()];
-        for pairs in 1..=FUZZY_SOUND {
+        for pairs in 1..=(FUZZY_PAIR_BITS + 3) {
+            let wide = pairs == FUZZY_PAIR_BITS + 1 || pairs == FUZZY_PAIR_BITS + 3;
+            if pairs >= FUZZY_PAIR_BITS + 2 {
+                // keys table (and the union with wide for +3), built from key slips of every syllable
+                let mut alts: HashMap<u32, BTreeSet<u32>> = HashMap::new();
+                let by_str: HashMap<&str, u32> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i as u32)).collect();
+                for (id, n) in names.iter().enumerate() {
+                    for shown in key_slips(n) {
+                        if let Some(&j) = by_str.get(shown.as_str()) {
+                            if j != id as u32 {
+                                alts.entry(j).or_default().insert(id as u32);
+                                alts.entry(id as u32).or_default().insert(j);
+                            }
+                        }
+                    }
+                }
+                if pairs == FUZZY_PAIR_BITS + 3 {
+                    let mut groups: HashMap<String, BTreeSet<u32>> = HashMap::new();
+                    for (id, n) in names.iter().enumerate() {
+                        groups.entry(normal_wide(n)).or_default().insert(id as u32);
+                    }
+                    for group in groups.into_values().filter(|g| g.len() > 1) {
+                        for &id in &group {
+                            let e = alts.entry(id).or_default();
+                            for &o in &group { if o != id { e.insert(o); } }
+                        }
+                    }
+                }
+                let mut table = HashMap::new();
+                for (id, set) in alts { table.insert(id, by_name(set)); }
+                sound.push(table);
+                continue;
+            }
             let mut groups: HashMap<String, BTreeSet<u32>> = HashMap::new();
             for (id, n) in names.iter().enumerate() {
-                groups.entry(normal(n, pairs)).or_default().insert(id as u32);
+                let key = if wide { normal_wide(n) } else { normal(n, pairs) };
+                groups.entry(key).or_default().insert(id as u32);
             }
             let mut table = HashMap::new();
             for group in groups.into_values().filter(|g| g.len() > 1) {
@@ -124,7 +219,7 @@ impl Tolerance {
 
     /// Alternatives of syllable `id` with the pairs in `flags` (bits 0-3) enabled.
     pub(crate) fn sound(&self, id: u32, flags: u32) -> &[u32] {
-        self.sound.get((flags & FUZZY_SOUND) as usize).and_then(|t| t.get(&id)).map_or(&[], |b| b)
+        self.sound.get(match (flags & FUZZY_WIDE != 0, flags & FUZZY_KEYS != 0) { (true, true) => (FUZZY_PAIR_BITS + 3) as usize, (true, false) => (FUZZY_PAIR_BITS + 1) as usize, (false, true) => (FUZZY_PAIR_BITS + 2) as usize, _ => (flags & FUZZY_PAIR_BITS) as usize }).and_then(|t| t.get(&id)).map_or(&[], |b| b)
     }
 
     /// Lexicon syllables a shown reading may have been typed from.

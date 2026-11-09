@@ -348,7 +348,7 @@ fn run_lm(args: &[String], len: &Lenient) -> Result<(), String> {
                 delta_sound = val()?.parse::<f64>().ok().filter(|d| d.is_finite() && *d > 0.0).ok_or("--fuzzy-delta-sound takes a number above 0")?;
                 delta_given = true;
             }
-            "--fuzzy" => fuzzy = Some(val()?.parse::<u32>().ok().filter(|f| f & !FUZZY_ALL == 0).ok_or("--fuzzy takes flags 0-31")?),
+            "--fuzzy" => fuzzy = Some(val()?.parse::<u32>().ok().filter(|f| f & !FUZZY_ALL == 0).ok_or("--fuzzy takes flags 0-127")?),
             "--no-reading-decode" => reading_decode = false,
             _ => return Err("unknown argument".into()),
         }

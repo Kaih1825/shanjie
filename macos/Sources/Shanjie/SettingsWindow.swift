@@ -275,6 +275,8 @@ struct SettingsPageForm: View {
             case .candidates:
                 Section("選字") {
                     Toggle(MenuEntry.Text.prediction, isOn: Binding(get: { model.prediction }, set: { model.setPrediction($0) }))
+                    Toggle("預測用半透明文字顯示（按 Tab 接受）", isOn: Binding(get: { model.ghost }, set: { model.setGhost($0) }))
+                        .disabled(!model.prediction)
                     // docs/spec/prediction.md §9.4: right under 即時預測, greyed (setting kept) while it is off; not in the menu.
                     Toggle(MenuEntry.Text.browserFirstSyllable,
                            isOn: Binding(get: { model.browserFirstSyllable }, set: { model.setBrowserFirstSyllable($0) }))
