@@ -8,3 +8,6 @@
 - **打錯注音修正**（`core/src/fuzzy.rs`）：新增 `FUZZY_WIDE`（送氣／翹舌／ㄣㄥ／ㄢㄤ／聲調類別）與 `FUZZY_KEYS`（鍵盤上下左右鄰鍵，含聲調鍵，對合法音節也生效）；預設旗標 112，`DELTA_SOUND` 2.5。
 - **中英混打預設關**。
 - **修正**：輸入來源圖示標籤至少兩個字（一個字會讓系統的切換提示崩潰，備忘錄閃退）。
+
+## Composition freeze window
+`CAP_WINDOW_MAX = 24`, `CAP_BUFFER = 8` (engine.rs): once a free stretch passes 24 characters, older words are frozen so later typing no longer rewrites them. Upstream's window was ctx-3 (61 without a model).

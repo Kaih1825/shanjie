@@ -536,7 +536,9 @@ const CAP_WINDOW_NO_MODEL: usize = 61;
 /// docs/spec/keys-and-composition.md §5.3: once a free stretch is longer than W the freeze goes on down to W - H characters, so a head that has left the
 /// window is not decoded again and only about one key in H decodes twice (measured: with H = 0 almost every key past W froze one more word and
 /// decoded twice, 26 ms against 13 to 17 expected).
-const CAP_BUFFER: usize = 16;
+const CAP_BUFFER: usize = 8;
+/// Personal fork: the free-stretch window is capped at this many characters, so text older than ~16-24 characters stops changing when later syllables arrive.
+const CAP_WINDOW_MAX: usize = 24;
 
 /// docs/spec/keys-and-composition.md §5.3 step 3: a word that was not frozen before the key is not frozen when it ends less than this many syllables
 /// before the longest common prefix of the syllables before and after the key, i.e. right at the edit. Typing in the middle of a long stretch
@@ -2468,7 +2470,7 @@ impl Engine {
     /// `CAP_WINDOW_NO_MODEL`), and `CAP_BUFFER`, except that a window not wider than the buffer (a model with ctx 19 or less; none is made
     /// and none is tested) freezes down to W itself, there being no room for a buffer. `None`: ctx 3 or less, nothing fits any window.
     fn cap_window(&self) -> Option<(usize, usize)> {
-        let w = self.tinylm.as_ref().map_or(Some(CAP_WINDOW_NO_MODEL), |m| m.ctx().checked_sub(3)).filter(|&w| w > 0)?;
+        let w = self.tinylm.as_ref().map_or(Some(CAP_WINDOW_NO_MODEL), |m| m.ctx().checked_sub(3)).filter(|&w| w > 0)?.min(CAP_WINDOW_MAX);
         Some((w, if w > CAP_BUFFER { CAP_BUFFER } else { 0 }))
     }
 
