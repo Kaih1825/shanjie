@@ -6,9 +6,11 @@ import ShanjieKit
 /// vertical orientation, so every output is one column of up to nine rows.
 @MainActor
 final class AppleListView: NSView {
-    static let rowH: CGFloat = 28
-    static let minWidth: CGFloat = 160
-    static let scrollerInset: CGFloat = 15
+    static let rowH: CGFloat = 29
+    static let pad: CGFloat = 4
+    static func textX(_ numbered: Bool) -> CGFloat { pad + (numbered ? 26 : 12) }
+    static let minWidth: CGFloat = 140
+    static let scrollerInset: CGFloat = 10
 
     var items: [String] = []
     var notes: [String?] = []
@@ -25,10 +27,10 @@ final class AppleListView: NSView {
     static func width(items: [String], notes: [String?], total: Int, numbered: Bool) -> CGFloat {
         var w = minWidth
         for (i, t) in items.enumerated() {
-            let tw = (t as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 17, weight: .medium)]).width
-            var need = (numbered ? 17 : 10) + tw + 14
+            let tw = (t as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 16)]).width
+            var need = textX(numbered) + tw + pad + 14
             if i < notes.count, let n = notes[i] {
-                need += (n as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .semibold)]).width + 12
+                need += (n as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width + 16
             }
             w = max(w, need)
         }
@@ -37,54 +39,53 @@ final class AppleListView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        (dark ? NSColor(white: 1, alpha: 0.10) : NSColor(white: 1, alpha: 0.25)).setFill()
+        (dark ? NSColor(white: 0, alpha: 0.18) : NSColor(white: 1, alpha: 0.35)).setFill()
         bounds.fill()
+        let pad = Self.pad
         let rightInset: CGFloat = needsScroller ? Self.scrollerInset : 0
+        let accent = NSColor.controlAccentColor
         for i in items.indices {
-            let y = CGFloat(i) * Self.rowH
-            let rect = NSRect(x: 0, y: y, width: bounds.width - rightInset, height: Self.rowH)
+            let y = pad + CGFloat(i) * Self.rowH
+            let rect = NSRect(x: pad, y: y, width: bounds.width - 2 * pad - rightInset, height: Self.rowH)
             let isSel = i == selected
             if isSel {
-                (NSColor.controlAccentColor.blended(withFraction: 0.13, of: .black) ?? NSColor.controlAccentColor).setFill()
-                rect.fill()
-            } else {
-                NSColor.labelColor.withAlphaComponent(0.10).setFill()
-                NSRect(x: 0, y: y + Self.rowH - 0.5, width: rect.width, height: 0.5).fill()
+                accent.setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
             }
             if numbered {
                 let label = (selected < 0 && i == 0) ? "⇥" : "\(i + 1)"
-                let color: NSColor = isSel ? .white : NSColor.labelColor.withAlphaComponent(0.4)
-                let s = NSAttributedString(string: label, attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: color])
+                let color: NSColor = isSel ? NSColor.white.withAlphaComponent(0.75) : NSColor.labelColor.withAlphaComponent(0.35)
+                let s = NSAttributedString(string: label, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium), .foregroundColor: color])
                 let sz = s.size()
-                s.draw(at: NSPoint(x: 6, y: y + (Self.rowH - sz.height) / 2 + 1))
+                s.draw(at: NSPoint(x: rect.minX + 8 + (9 - sz.width) / 2, y: y + (Self.rowH - sz.height) / 2))
             }
             let text = items[i]
             let isEmoji = text.unicodeScalars.first.map { $0.properties.isEmojiPresentation } ?? false
-            let tf = NSFont.systemFont(ofSize: isEmoji ? 20 : 17, weight: .medium)
+            let tf = NSFont.systemFont(ofSize: isEmoji ? 19 : 16.5, weight: .regular)
             let ts = NSAttributedString(string: text, attributes: [.font: tf, .foregroundColor: isSel ? NSColor.white : NSColor.labelColor])
             let tsz = ts.size()
-            ts.draw(at: NSPoint(x: numbered ? 17 : 10, y: y + (Self.rowH - tsz.height) / 2))
+            ts.draw(at: NSPoint(x: rect.minX + Self.textX(numbered) - pad, y: y + (Self.rowH - tsz.height) / 2))
             if i < notes.count, let note = notes[i] {
-                let gc: NSColor = isSel ? NSColor.white.withAlphaComponent(0.85) : .secondaryLabelColor
-                let gs = NSAttributedString(string: note, attributes: [.font: NSFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: gc])
+                let gc: NSColor = isSel ? NSColor.white.withAlphaComponent(0.8) : .secondaryLabelColor
+                let gs = NSAttributedString(string: note, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: gc])
                 let gsz = gs.size()
-                gs.draw(at: NSPoint(x: bounds.width - rightInset - 12 - gsz.width, y: y + (Self.rowH - gsz.height) / 2))
+                gs.draw(at: NSPoint(x: rect.maxX - 10 - gsz.width, y: y + (Self.rowH - gsz.height) / 2))
             }
         }
         if needsScroller {
             let h = CGFloat(items.count) * Self.rowH
             let thumbH = max(24, h * CGFloat(items.count) / CGFloat(max(total, 1)))
-            let travel = h - thumbH - 8
+            let travel = h - thumbH
             let t = total > items.count ? CGFloat(first) / CGFloat(total - items.count) : 0
-            let thumb = NSRect(x: bounds.width - 11, y: 4 + travel * min(max(t, 0), 1), width: 7, height: thumbH)
-            (dark ? NSColor(white: 0.6, alpha: 0.95) : NSColor(white: 0.74, alpha: 0.95)).setFill()
-            NSBezierPath(roundedRect: thumb, xRadius: 3.5, yRadius: 3.5).fill()
+            let thumb = NSRect(x: bounds.width - pad - 5, y: pad + travel * min(max(t, 0), 1), width: 4, height: thumbH)
+            NSColor.labelColor.withAlphaComponent(dark ? 0.3 : 0.25).setFill()
+            NSBezierPath(roundedRect: thumb, xRadius: 2, yRadius: 2).fill()
         }
     }
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        let i = Int(p.y / Self.rowH)
+        let i = Int((p.y - Self.pad) / Self.rowH)
         if i >= 0, i < items.count { onClick?(i) }
     }
 
@@ -164,11 +165,11 @@ final class ApplePanelAdapter: CandidatePanel {
         list.total = total
         list.numbered = numbered
         let size = NSSize(width: AppleListView.width(items: items, notes: notes, total: total, numbered: numbered),
-                          height: CGFloat(max(items.count, 1)) * AppleListView.rowH)
+                          height: CGFloat(max(items.count, 1)) * AppleListView.rowH + 2 * AppleListView.pad)
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
         let main = NSScreen.main.flatMap { m in screens.firstIndex(of: m) } ?? 0
-        let p = PanelPlacement.topLeft(line: lineRect, last: lastLine, size: size, alignOffset: numbered ? 17 : 10,
+        let p = PanelPlacement.topLeft(line: lineRect, last: lastLine, size: size, alignOffset: AppleListView.textX(numbered),
                                        screens: screens.map { PanelPlacement.Screen(frame: $0.frame, visibleFrame: $0.visibleFrame) },
                                        main: main)
         if let lineRect { lastLine = lineRect }
