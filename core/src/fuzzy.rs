@@ -26,7 +26,7 @@ pub const FUZZY_ALL: u32 = FUZZY_SOUND | FUZZY_ADJACENT;
 /// Score taken off a word read through one tolerant syllable (log10, as the demotion deltas). The sound pairs' value is 2.5, the
 /// cell docs/spec/decoder.md §6.1 chose with the shipping setting (the research's 1 was chosen with no word pack,
 /// no small model and no Kneser-Ney, and let a tolerant common word cover the typed reading); the adjacent-key value is the research's.
-pub const DELTA_SOUND: f64 = 2.5;
+pub const DELTA_SOUND: f64 = 3.5;
 pub const DELTA_ADJACENT: f64 = 2.0;
 
 /// Keyboard rows (docs/spec/decoder.md §6.2): a key's neighbours are the keys left and right in its row.
