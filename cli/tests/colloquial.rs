@@ -194,7 +194,7 @@ fn level_rows(dir: &Path) -> String {
 }
 
 /// docs/spec/semantic-rerank.md §4.4: with `--colloquial-core` the terms apply at every strength, each with its own (alpha, tau, delta), and the summary
-/// tag says so (`+colloq:`, after `+rl:` at the other two; then the reading term's `+rd+rx:`). The picks are those the CLI gives on the final 會意 SJ-SR-8-15M
+/// tag says so (`+colloq:`, after `+rl:` at the other two; then the reading term's `+rd+rx:…+rm`). The picks are those the CLI gives on the final 會意 SJ-SR-8-15M
 /// file with the cells of docs/spec/semantic-rerank.md §4.4 (measured 2026-11-06 with `--rows` over the four rows, `--tinylm-scores` `c`; the cell arithmetic itself is
 /// `core/src/colloquial.rs`'s unit tests): standard (1.1, 2, 0) [1, 5, 2, 3]; conservative (1.3, 2, 1) keeps the n-gram first on rows 25 and 22 of dev302 where
 /// the standard cell picks 1 and 2 (the conservative delta), and picks the standard's 5 and 3 on the other two; aggressive is the standard cell, so the same
@@ -219,7 +219,7 @@ fn the_term_applies_at_every_strength() {
         let new = full_run(&a, &BASE[..9], &set, &[&extra[..], &["--colloquial-core", TABLE]].concat());
         assert_eq!(chosen(&new.sc), with, "{level}: the level's own cell");
         let rl = if level == "standard" { String::new() } else { format!("+rl:{level}") };
-        assert!(new.stdout.contains(&format!("{rl}+acg+tri:24ee8645+colloq:81c2470d+rd+rx:a821a206  {{")), "{level}: {}", new.stdout);
+        assert!(new.stdout.contains(&format!("{rl}+acg+tri:24ee8645+colloq:81c2470d+rd+rx:a821a206+rm  {{")), "{level}: {}", new.stdout);
         if let Some(plain) = without {
             let old = full_run(&b, &BASE[..9], &set, &extra);
             assert_eq!(chosen(&old.sc), plain, "{level}: the header triple, no term");
@@ -293,7 +293,7 @@ fn the_colloquial_term_stands_alone() {
     for out in [&with.stdout, &off.stdout] {
         assert!(out.contains("+colloq:81c2470d") && !out.contains("+rc"), "{out}");
     }
-    assert!(with.stdout.contains("+colloq:81c2470d+rd+rx:a821a206  {") && off.stdout.contains("+colloq:81c2470d  {"), "{}{}", with.stdout, off.stdout);
+    assert!(with.stdout.contains("+colloq:81c2470d+rd+rx:a821a206+rm  {") && off.stdout.contains("+colloq:81c2470d  {"), "{}{}", with.stdout, off.stdout);
     let mut args: Vec<String> = BASE[..9].iter().map(|s| s.to_string()).collect();
     args.extend(["--rows".to_string(), rows.clone(), "--colloquial-core".to_string(), TABLE.to_string(), "--no-reading-channel".to_string()]);
     let o = run(&args);
@@ -302,8 +302,9 @@ fn the_colloquial_term_stands_alone() {
 
 /// SR-TW product (docs/spec/semantic-rerank.md §4.5): the mild first-word estimate is on by default, with no tag suffix (the shipping tag stays
 /// `+colloq:81c2470d`); `--colloquial-no-unseen-start-unigram` turns it off and the tag gets `+us0`; `--colloquial-first-unigram` still runs (it used to be
-/// refused with the estimate flag) and is tagged `+fu`; the research flag needs the table. Row 179 of eval/dev/user-reported.txt (`權限加好了`, public): `c` 0
-/// by default, 3 without the estimate (measured 2026-11-06, `--rerank-level standard`).
+/// refused with the estimate flag) and is tagged `+fu`; the research flag needs the table. Row 179 of eval/dev/user-reported.txt (`權限加好了`, public): the
+/// estimate changes the colloquial scores of its candidates (`col`). It used to change the pick too (`c` 0 by default, 3 = 全線 without the estimate, measured
+/// 2026-11-06); since 權限 is a rerank-protect word (data/lexicon/rerank-protect.tsv) the mask keeps candidate 0 either way.
 #[test]
 fn the_first_word_estimate_is_on_by_default_and_the_flag_turns_it_off() {
     let d = tmp("us0");
@@ -314,7 +315,9 @@ fn the_first_word_estimate_is_on_by_default_and_the_flag_turns_it_off() {
     let set = ["--rows", rows.to_str().unwrap()];
     let run_with = |name: &str, extra: &[&str]| full_run(&tmp(name), &BASE[..9], &set, &[&["--colloquial-core", TABLE][..], extra].concat());
     let (on, off, fu) = (run_with("us-on", &[]), run_with("us-off", &["--colloquial-no-unseen-start-unigram"]), run_with("us-fu", &["--colloquial-first-unigram"]));
-    assert_eq!((chosen(&on.sc), chosen(&off.sc)), (vec![0], vec![3]), "the estimate changes this row");
+    let col = |sc: &str| sc.split("\"col\": ").nth(1).map(|t| t.split(']').next().unwrap().to_string()).expect("a col field");
+    assert_ne!(col(&on.sc), col(&off.sc), "the estimate changes this row's colloquial scores");
+    assert_eq!((chosen(&on.sc), chosen(&off.sc)), (vec![0], vec![0]), "the protect word 權限 keeps candidate 0 with and without the estimate");
     assert!(on.stdout.contains("+colloq:81c2470d+rd+rx:") && !on.stdout.contains("+us"), "{}", on.stdout);
     assert!(off.stdout.contains("+colloq:81c2470d+us0+rd+rx:"), "{}", off.stdout);
     assert!(fu.stdout.contains("+colloq:81c2470d+fu+rd+rx:"), "{}", fu.stdout);

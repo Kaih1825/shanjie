@@ -301,6 +301,30 @@ class LegacyExport(Tmp):
         with mock.patch.object(bench, "sh", stop_at_cargo), self.assertRaises(Stop):
             w.build()
         self.assertEqual(open(os.path.join(w.dir, "Cargo.toml")).read(), "new")
+        self.assertFalse(os.path.exists(os.path.join(v.dir, "windows")))   # a tree without windows/ exports without it
+
+    def test_a_tree_with_windows_members_exports_them_and_a_stale_export_is_redone(self):
+        def stop_at_cargo(cmd, **kw):
+            if cmd[0] == "cargo":
+                raise Stop
+            return real_sh(cmd, **kw)
+        real_sh = bench.sh
+        fp = os.path.join(self.new, "windows/proto/Cargo.toml")
+        os.makedirs(os.path.dirname(fp))
+        open(fp, "w").write("member")
+        git(self.new, "add", "-A")
+        git(self.new, "commit", "-q", "-m", "windows")
+        git(self.new, "branch", "-f", "feature")
+        x = bench.Ver("feature")
+        for f in ("Cargo.toml", "Cargo.lock", "core/a.rs", "cli/a.rs", "data/a.txt", "eval/variants.tsv"):   # a stale export of this
+            os.makedirs(os.path.dirname(os.path.join(x.dir, f)), exist_ok=True)                            # commit: the six old paths
+            open(os.path.join(x.dir, f), "w").write("stale")                                                # and the marker, no windows/
+        open(os.path.join(x.dir, ".exported"), "w").close()
+        with mock.patch.object(bench, "sh", stop_at_cargo), self.assertRaises(Stop):
+            x.build()
+        self.assertEqual(open(os.path.join(x.dir, "windows/proto/Cargo.toml")).read(), "member")
+        self.assertEqual(open(os.path.join(x.dir, "Cargo.toml")).read(), "new")   # exported again, not the stale copy
+        self.assertTrue(os.path.isfile(os.path.join(x.dir, ".exported")))
 
     def test_the_cache_key_is_the_commit_so_another_clone_path_reuses_it(self):
         other = os.path.join(self.td, "legacy-copy")
@@ -704,7 +728,7 @@ class SuiteV2(Tmp):
 
     def test_reading_version_ends_every_tag_with_rd_rx_and_has_no_rc(self):
         """docs/spec/decoder.md §5: a version with `"reading": True` ships the decoder's reading term. Every setting's tag (chat, formal, the anchor
-        run, the replay-setting cell) ends in `+rd+rx:<sha8 of its data/lexicon/std-exempt.tsv>`, and the colloquial tag has no `+rc` any more (the term was
+        run, the replay-setting cell) ends in `+rd+rx:<sha8 of its data/lexicon/std-exempt.tsv>+rm`, and the colloquial tag has no `+rc` any more (the term was
         removed); a version without the key keeps `+rc` and gets no `+rd` (the previous test and `test_sj_lm_7_version_...`). The export must hold the file."""
         spec = {"release": "vR", "flags": ["--context", "--packs", "acg"], "tinylm": True, "colloquial": True, "reading": True, "tag": "+ctx+tl:{tl8}+acg"}
         HEX["colloquial.sjlm"] = "2984eeb5" + "d" * 56
@@ -723,14 +747,14 @@ class SuiteV2(Tmp):
             with mock_hash():
                 bench.setup_models(v, spec, os.path.join(self.td, "mf"))
             self.assertEqual(v.rx8, rx8)
-            self.assertEqual(bench.expected_tag(v, "chat", False), f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rd+rx:{rx8}")
-            self.assertEqual(bench.expected_tag(v, "formal", False), f"lm-formal+ctx+tl:7e73ef67+acg+rd+rx:{rx8}")
-            self.assertEqual(bench.expected_tag(v, "chat", True), f"lm-chat+ctx+tl:7e73ef67+rd+rx:{rx8}")
-            self.assertEqual(bench.replay_tag(v, "chat"), f"lm-chat+rd+rx:{rx8}")
+            self.assertEqual(bench.expected_tag(v, "chat", False), f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rd+rx:{rx8}+rm")
+            self.assertEqual(bench.expected_tag(v, "formal", False), f"lm-formal+ctx+tl:7e73ef67+acg+rd+rx:{rx8}+rm")
+            self.assertEqual(bench.expected_tag(v, "chat", True), f"lm-chat+ctx+tl:7e73ef67+rd+rx:{rx8}+rm")
+            self.assertEqual(bench.replay_tag(v, "chat"), f"lm-chat+rd+rx:{rx8}+rm")
             # a cell is scored against that tag: the old tag (with +rc, or without the reading marks) is not the shipping setting of this version
             self.fake_cli(bench.expected_tag(v, "chat", False), [True, True], ("你好", "世界"))
-            self.assertEqual(bench.run_cell2(self.ctx, v, "pub", "chat", False)[0]["tag"], f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rd+rx:{rx8}")
-            for tag in ("lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rc", "lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5", f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rc+rd+rx:{rx8}"):
+            self.assertEqual(bench.run_cell2(self.ctx, v, "pub", "chat", False)[0]["tag"], f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rd+rx:{rx8}+rm")
+            for tag in ("lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rc", "lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5", f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rc+rd+rx:{rx8}+rm", f"lm-chat+ctx+tl:7e73ef67+acg+colloq:2984eeb5+rd+rx:{rx8}"):
                 self.fake_cli(tag, [True, True], ("你好", "世界"))
                 with self.assertRaises(RuntimeError):
                     bench.run_cell2(self.ctx, v, "pub", "chat", False)
@@ -792,14 +816,14 @@ class SuiteV2(Tmp):
                  "accuracy": {"dev302/chat": cell, "discordtune/chat": {"missing": True}}, "vs_prev": {"dev302/chat": {"fixed": 3, "broken": 1, "p": 0.625}},
                  "speed": dict(speed, rerank_p50_ms=7.0, rerank_p95_ms=12.0, formal=dict(speed, rss_mb=170)), "holdout": {"commit": "e" * 40, "chat": {"n": 227, "top1": 191, "fixed": 11, "broken": 0, "p": 0.001}}}]
         v2 = {"label": "v0.4.0+v0.4.1", "suite": "v2", "date": "2026-10-13", "env": env, "versions": recs}
-        out = os.path.join(bench.ROOT, "docs/benchmark.md")
+        out = os.path.join(self.td, "benchmark.md")   # the full table goes outside the repository
         with open(os.path.join(bench.RESULTS, "2026-10-05-baseline.json"), "w") as f:
             json.dump(v1, f)
-        bench.cmd_table(None)
+        bench.cmd_table(argparse.Namespace(md=out))
         before = open(out, encoding="utf-8").read()
         with open(os.path.join(bench.RESULTS, "v2-v0.4.0+v0.4.1.json"), "w") as f:
             json.dump(v2, f)
-        bench.cmd_table(None)
+        bench.cmd_table(argparse.Namespace(md=out))
         after = open(out, encoding="utf-8").read()
         self.assertTrue(after.startswith(before))
         self.assertEqual(after.count("\n## "), before.count("\n## ") + 1)
@@ -813,7 +837,7 @@ class SuiteV2(Tmp):
         self.assertIn("| v0.4.1 書面 | 2026-10-13 | 同上 | 1.000 ms | 2.00 ms | 5 ms | 170 MB | 99 | 302/302 |", tail)  # the formal replay row
         self.assertIn("| v0.4.0 書面 | 2026-10-13 | 同上 | — | — |", tail)  # a result without one: "—"
         self.assertNotIn("v0.4.1", before)
-        bench.cmd_table(None)  # deterministic
+        bench.cmd_table(argparse.Namespace(md=out))  # deterministic
         self.assertEqual(open(out, encoding="utf-8").read(), after)
 
     def test_holdout_numbers_stay_in_their_own_set_column(self):
@@ -852,7 +876,7 @@ PRIVATE_WORDS = ("discordtune", "cvtune", "wikitune", "lytune", "newstune", "cha
 
 
 class SiteData(Tmp):
-    """`table` writes docs/benchmark.md and site/data/bench.json from one read of the same files; the JSON holds public sets only."""
+    """`table` writes the full table (outside the repository) and site/data/bench.json from one read of the same files; the JSON holds public sets only."""
 
     def setUp(self):
         super().setUp()
@@ -891,8 +915,42 @@ class SiteData(Tmp):
             json.dump(data, f, ensure_ascii=False)
 
     def table(self):
-        bench.cmd_table(None)
-        return (open(os.path.join(bench.ROOT, "docs/benchmark.md"), "rb").read(), open(os.path.join(bench.ROOT, "site/data/bench.json"), "rb").read())
+        md = os.path.join(self.td, "tables", "benchmark.md")
+        bench.cmd_table(argparse.Namespace(md=md))
+        return (open(md, "rb").read(), open(os.path.join(bench.ROOT, "site/data/bench.json"), "rb").read())
+
+    def written(self):
+        return sorted(os.path.relpath(os.path.join(d, f), self.td) for d, _, fs in os.walk(self.td) for f in fs if f.endswith((".md", "bench.json")))
+
+    def test_without_a_path_only_the_json_is_written(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ), contextlib.redirect_stderr(err):
+            os.environ.pop("SHANJIE_TABLES", None)
+            bench.cmd_table(argparse.Namespace(md=None))
+        self.assertEqual(self.written(), ["root/site/data/bench.json"])
+        self.assertIn("benchmark.md not written", err.getvalue())
+
+    def test_shanjie_tables_names_the_folder(self):
+        d = os.path.join(self.td, "tables")   # does not exist yet: table creates it
+        with mock.patch.dict(os.environ, {"SHANJIE_TABLES": d}):
+            bench.cmd_table(argparse.Namespace(md=None))
+        self.assertEqual(self.written(), ["root/site/data/bench.json", "tables/benchmark.md"])
+
+    def test_a_path_inside_the_repository_is_refused_before_anything_is_written(self):
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(bench.ROOT)   # the relative path below resolves inside the repository
+        for md, env in ((os.path.join(bench.ROOT, "docs/benchmark.md"), None), ("docs/benchmark.md", None), (None, bench.ROOT),
+                        (os.path.join(os.path.dirname(bench.ROOT), "ROOT", "docs", "benchmark.md"), None)):   # case-insensitive volumes
+            with self.subTest(md=md, env=env), mock.patch.dict(os.environ), contextlib.redirect_stderr(io.StringIO()) as err:
+                os.environ.pop("SHANJIE_TABLES", None)
+                if env:
+                    os.environ["SHANJIE_TABLES"] = env
+                with self.assertRaises(SystemExit) as cm:
+                    bench.cmd_table(argparse.Namespace(md=md))
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("inside this repository", err.getvalue())
+                self.assertEqual(self.written(), [])   # not even the JSON
 
     def test_two_runs_are_byte_identical(self):
         a = self.table()
@@ -936,6 +994,61 @@ class SiteData(Tmp):
         self.assertIn(f"+{v['vs_prev']['dev302/chat']['fixed']} / −{v['vs_prev']['dev302/chat']['broken']}", md)
         self.assertIn(f"{v['speed']['formal']['rss_mb']:.0f} MB", md)
         self.assertIn(f"{v['holdout_chat']['top1']}/{v['holdout_chat']['n']}", md)
+
+
+class SpeedWindow(unittest.TestCase):
+    """docs/spec/evaluation.md §7.5: the machine's state right before and right after the speed measurement."""
+
+    def test_reads_then_measures_then_reads(self):
+        calls, loads, tms = [], iter([1.5, 4.25]), iter([False, True])
+        def measure(ctx, vers):
+            calls.append("measure")
+            return {"sha": {"p95_us": 1.0}}
+        def load():
+            calls.append("load")
+            return next(loads)
+        def tm():
+            calls.append("tm")
+            return next(tms)
+        ctx = types.SimpleNamespace(files={"dev302": "rows"})
+        speed, fields = bench.speed_window(ctx, ["v"], measure=measure, tm=tm, load=load)
+        self.assertEqual(calls, ["load", "tm", "measure", "load", "tm"])
+        self.assertEqual(speed, {"sha": {"p95_us": 1.0}})
+        self.assertEqual(fields, {"speed_load_before": 1.5, "speed_tm_before": False, "speed_load_after": 4.25, "speed_tm_after": True})
+
+    def test_the_default_measure_is_measure_speed2(self):
+        ctx = types.SimpleNamespace(files={"dev302": "rows"})
+        with mock.patch.object(bench, "measure_speed2", return_value={"sha": {}}) as m:
+            speed, fields = bench.speed_window(ctx, ["v"], tm=lambda: None, load=lambda: 0.5)
+        m.assert_called_once_with(ctx, ["v"])
+        self.assertEqual((speed, fields["speed_tm_before"], fields["speed_tm_after"]), ({"sha": {}}, None, None))
+
+    def test_without_dev302_nothing_is_measured_or_read(self):
+        def boom(*a):
+            raise AssertionError("called")
+        self.assertEqual(bench.speed_window(types.SimpleNamespace(files={}), ["v"], measure=boom, tm=boom, load=boom), ({}, {}))
+
+    def run_tm(self, platform="darwin", **kw):
+        """tm_running() with subprocess.run replaced: never the real tmutil."""
+        with mock.patch.object(bench.sys, "platform", platform), mock.patch.object(bench.subprocess, "run", **kw) as run:
+            return bench.tm_running(), run
+
+    def test_tm_running_reads_tmutil_status(self):
+        out = lambda text, rc=0: types.SimpleNamespace(returncode=rc, stdout=text)
+        got, run = self.run_tm(return_value=out("Backup session status:\n{\n    Running = 1;\n    Percent = 0;\n}\n"))
+        self.assertIs(got, True)
+        self.assertEqual(run.call_args.args[0], ["tmutil", "status"])
+        self.assertEqual(run.call_args.kwargs.get("timeout"), 30)
+        self.assertIs(self.run_tm(return_value=out("Backup session status:\n{\n    Running = 0;\n}\n"))[0], False)
+        self.assertIs(self.run_tm(return_value=out("    NotRunning = 1;\n"))[0], False)   # the key itself, not a longer one that ends in it
+        self.assertIsNone(self.run_tm(return_value=out("    Running = 1;\n", rc=1))[0])    # tmutil failed: unknown, whatever it printed
+
+    def test_tm_running_is_unknown_when_it_cannot_ask(self):
+        self.assertIsNone(self.run_tm(side_effect=subprocess.TimeoutExpired("tmutil", 30))[0])
+        self.assertIsNone(self.run_tm(side_effect=FileNotFoundError("tmutil"))[0])
+        got, run = self.run_tm(platform="linux", return_value=types.SimpleNamespace(returncode=0, stdout="    Running = 1;\n"))
+        self.assertIsNone(got)
+        run.assert_not_called()   # not macOS: tmutil is not run at all
 
 
 if __name__ == "__main__":

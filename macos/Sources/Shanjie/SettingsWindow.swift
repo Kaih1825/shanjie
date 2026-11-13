@@ -158,7 +158,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 /// The sidebar pages (docs/spec/macos-shell.md §9.2), in sidebar order.
 enum SettingsPage: CaseIterable, Hashable {
     /// 關於 last (docs/spec/install-and-update.md §3.4–§3.6).
-    case general, candidates, appearance, memory, about
+    case general, candidates, appearance, memory, diagnostics, about
 
     var title: String {
         switch self {
@@ -166,6 +166,7 @@ enum SettingsPage: CaseIterable, Hashable {
         case .candidates: "選字"
         case .appearance: "外觀"
         case .memory: "選字記憶"
+        case .diagnostics: "診斷"
         case .about: "關於"
         }
     }
@@ -177,6 +178,7 @@ enum SettingsPage: CaseIterable, Hashable {
         case .candidates: "character.cursor.ibeam"
         case .appearance: "paintpalette"
         case .memory: "brain"
+        case .diagnostics: "stethoscope"
         case .about: "info.circle"
         }
     }
@@ -342,6 +344,7 @@ struct SettingsPageForm: View {
                     Toggle(MenuEntry.Text.quotePack, isOn: Binding(get: { model.quotePack }, set: { model.setQuotePack($0) }))
                     Toggle(MenuEntry.Text.itPack, isOn: Binding(get: { model.itPack }, set: { model.setItPack($0) }))
                     Toggle(MenuEntry.Text.beautyPack, isOn: Binding(get: { model.beautyPack }, set: { model.setBeautyPack($0) }))
+                    Toggle(MenuEntry.Text.memePack, isOn: Binding(get: { model.memePack }, set: { model.setMemePack($0) }))
                 }
                 // docs/spec/decoder.md §6.1: all off by default. The adjacent-key checkbox is greyed (value kept) in the Eten layout, where
                 // the core does nothing with it.
@@ -392,14 +395,44 @@ struct SettingsPageForm: View {
                     Toggle(MenuEntry.Text.excludeBackup, isOn: Binding(get: { model.backupExcluded }, set: { model.setBackupExcluded($0) }))
                     Button(MenuEntry.Text.clear) { model.clear() }
                 }
+            case .diagnostics:
+                Section("診斷") {
+                    Toggle("記錄偶發問題的診斷資料", isOn: Binding(get: { model.diagLog }, set: { model.setDiagLog($0) }))
+                    Text("只存在這台 Mac 的記憶體裡，不會自動送出。會記下放開 Shift 時算不算單按（按著 Shift 打字時不記）、切換中英、換 App 的時間與 App 的識別碼（例如 com.apple.TextEdit），不記你打的字。紀錄留到輸入法結束，可能涵蓋好幾天；安全輸入時不記 Shift，切換中英照記。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("複製診斷紀錄…") { model.openDiagPreview() }
+                        .disabled(model.diagLogEmpty)
+                }
             case .about:
-                if let updates = model.updates { AboutSections(updates: updates) }
+                if let updates = model.updates {
+                    // docs/spec/install-and-update.md §3.8: the user may have just changed it in System Settings.
+                    AboutSections(updates: updates).onAppear { updates.refreshPermission() }
+                }
             }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)  // the window's glass shows through
         .frame(width: Self.formWidth)
+        // docs/spec/macos-shell.md §13.3: the whole text first; only 複製 puts it, unchanged, on the pasteboard.
+        .sheet(isPresented: Binding(get: { model.diagPreview != nil }, set: { if !$0 { model.closeDiagPreview() } })) {
+            VStack(alignment: .leading) {
+                ScrollView {
+                    Text(model.diagPreview ?? "").font(.system(.caption, design: .monospaced))  // not selectable: ⌘C would skip the copy below
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(width: Self.diagPreviewSize.width, height: Self.diagPreviewSize.height)
+                HStack {
+                    Spacer()
+                    Button("取消", role: .cancel) { model.closeDiagPreview() }.keyboardShortcut(.cancelAction)
+                    Button("複製") { model.copyDiagPreview(to: NSPasteboard.general) }
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding()
+        }
     }
+    /// The preview's text area: wide enough for a line of the log in the caption monospaced font; not measured against a reference.
+    private static let diagPreviewSize = CGSize(width: 460, height: 320)
 }
 
 /// The 關於 page (docs/spec/install-and-update.md §3.4–§3.6): version, the update controls, the site and the licence line. The
@@ -422,8 +455,18 @@ private struct AboutSections: View {
         }
         Section("更新") {
             Toggle("自動檢查更新", isOn: Binding(get: { updates.autoCheck }, set: { updates.setAutoCheck($0) }))
-            Text("開著時每天最多連線一次，到 GitHub 讀取有沒有新版本；有新版本只在這裡和輸入選單顯示，按下才更新。")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(UpdateText.autoCheckNote).font(.caption).foregroundStyle(.secondary)
+            // docs/spec/install-and-update.md §3.8: off with 自動檢查更新 (no background check, so no notification).
+            Toggle(UpdateText.notifyToggle, isOn: Binding(get: { updates.notifyEnabled }, set: { updates.setNotify($0) }))
+                .disabled(!updates.autoCheck)
+            Text(UpdateText.notifyNote).font(.caption).foregroundStyle(.secondary)
+            if updates.showsPermissionLine {
+                HStack {
+                    Text(UpdateText.permissionOff).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(UpdateText.openNotificationSettings) { updates.openNotificationSettings() }
+                }
+            }
             Text(UpdateText.location(bundleURL: Bundle.main.bundleURL)).font(.caption).foregroundStyle(.secondary)
             LabeledContent("上次檢查") {
                 Text(status).foregroundStyle(.secondary)

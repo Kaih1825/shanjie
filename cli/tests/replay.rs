@@ -1,18 +1,40 @@
 //! docs/spec/evaluation.md §4.9: the replay's rules, one test each, on the real engine, n-gram and small model.
 //! Rows are lines of eval/dev/user-reported.txt (public, CC0), whose first display is known to be wrong for most of them; every
-//! test states the display it relies on, so a model change fails there first. Each engine is about 700 MB, so the tests take turns.
+//! test states the display it relies on, so a model change fails there first. Each engine is about 700 MB, so at most
+//! ENGINES_AT_ONCE tests hold one (theirs or the CLI processes they start) at a time.
 use cli::common::{load_lenient, root};
 use cli::replay::{build_engine, keys_of, move_cost, replay_row, summary_line, Cfg, Rerank, RowOut};
 use core::engine::{Engine, Key, KeyKind, MAX_SYLLABLES};
 use core::eval::Lenient;
 use core::lm::Profile;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex};
 
-static ONE_ENGINE_AT_A_TIME: Mutex<()> = Mutex::new(());
+/// Two, not one: with 3 test threads (the macOS runner's cores) two engines at once made this file faster on the Mac and
+/// kept the summed RSS of the test process and its children under the limit (docs/spec/release-and-ci.md §4 has the numbers).
+const ENGINES_AT_ONCE: usize = 2;
+static BUSY: Mutex<usize> = Mutex::new(0);
+static FREED: Condvar = Condvar::new();
 
-fn engine(learn: bool) -> (MutexGuard<'static, ()>, Engine) {
-    let guard = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+/// One of the ENGINES_AT_ONCE places, held until dropped.
+struct Slot;
+fn slot() -> Slot {
+    let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    while *busy >= ENGINES_AT_ONCE {
+        busy = FREED.wait(busy).unwrap_or_else(|e| e.into_inner());
+    }
+    *busy += 1;
+    Slot
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        *BUSY.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        FREED.notify_one();
+    }
+}
+
+fn engine(learn: bool) -> (Slot, Engine) {
+    let guard = slot();
     let r = root();
     let e = build_engine(&r, &r.join("data/lm/bigram.sjlm"), Some(&r.join("data/lm/tinylm.sjtl")), None, Profile::Chat, learn).expect("data/lm models");
     (guard, e)
@@ -322,7 +344,7 @@ fn outputs_are_numbers_only_and_the_rowstats_are_the_clis() {
     let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
     let rows = std::fs::read_to_string(root().join("eval/dev/user-reported.txt")).unwrap().lines().take(20).collect::<Vec<_>>().join("\n") + "\n";
     std::fs::write(p("rows.txt"), rows).unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let replay = env!("CARGO_BIN_EXE_shanjie-replay");
     let eval = env!("CARGO_BIN_EXE_shanjie-eval");
     let r = root();
@@ -330,7 +352,7 @@ fn outputs_are_numbers_only_and_the_rowstats_are_the_clis() {
     let tl = r.join("data/lm/tinylm.sjtl");
     // The replay loads data/lm/colloquial.sjlm by default, as the App does, so the CLI is given it too.
     let co = r.join("data/lm/colloquial.sjlm");
-    let cli = run(eval, &["--lm", lm.to_str().unwrap(), "--profile", "chat", "--context", "--packs", "acg,it,beauty", "--tinylm", tl.to_str().unwrap(), "--colloquial-core", co.to_str().unwrap(), "--rows", &p("rows.txt"), "--rowstats", &p("cli.rs")]);
+    let cli = run(eval, &["--lm", lm.to_str().unwrap(), "--profile", "chat", "--context", "--packs", "acg,it,meme,beauty", "--tinylm", tl.to_str().unwrap(), "--colloquial-core", co.to_str().unwrap(), "--rows", &p("rows.txt"), "--rowstats", &p("cli.rs")]);
     let mine = run(replay, &["--rows", &p("rows.txt"), "--rowstats", &p("rep.rs"), "--keys", &p("rep.keys")]);
     assert_eq!(std::fs::read(p("cli.rs")).unwrap(), std::fs::read(p("rep.rs")).unwrap());
     assert_eq!(sha_of(&cli), sha_of(&mine));
@@ -361,11 +383,11 @@ fn colloquial_replay_agrees_with_the_cli() {
     assert!(lines[24].starts_with("|執行這個程式|"));
     std::fs::write(&rows, [&lines[..12], &lines[22..28]].concat().join("\n") + "\n").unwrap();
     let rows = rows.to_str().unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let (replay, eval, r) = (env!("CARGO_BIN_EXE_shanjie-replay"), env!("CARGO_BIN_EXE_shanjie-eval"), root());
     let (lm, tl, co) = (r.join("data/lm/bigram.sjlm"), r.join("data/lm/tinylm.sjtl"), r.join("data/lm/colloquial.sjlm"));
     let cli = |extra: &[&str]| {
-        let mut a = vec!["--lm", lm.to_str().unwrap(), "--profile", "chat", "--context", "--packs", "acg,it,beauty", "--tinylm", tl.to_str().unwrap(), "--rows", rows];
+        let mut a = vec!["--lm", lm.to_str().unwrap(), "--profile", "chat", "--context", "--packs", "acg,it,meme,beauty", "--tinylm", tl.to_str().unwrap(), "--rows", rows];
         a.extend_from_slice(extra);
         run(eval, &a)
     };
@@ -393,7 +415,7 @@ fn colloquial_replay_agrees_with_the_cli() {
 /// `--no-reading-decode`. The premise is asserted for each setting first: the term changes the CLI's choice among these rows, so an engine that left the term out
 /// could not pass. With the 會意 SJ-SR-8-15M file the re-ranker repairs main's two sentences in chat by itself, so there it is row 127 (急 with the term, 吃 without,
 /// measured 2026-11-06) that carries the premise; in the written setting rows 46 and 127 of user-reported change as well. The summary tag
-/// ends `+rd+rx:<sha8>` by default and has neither mark with the option.
+/// ends `+rd+rx:<sha8>+rm` by default and has none of the marks with the option.
 #[test]
 fn reading_decode_replay_agrees_with_the_cli() {
     let dir = std::env::temp_dir().join(format!("shanjie-replay-rd-{}", std::process::id()));
@@ -406,13 +428,13 @@ fn reading_decode_replay_agrees_with_the_cli() {
     )
     .unwrap();
     let rows = rows.to_str().unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let (replay, eval, r) = (env!("CARGO_BIN_EXE_shanjie-replay"), env!("CARGO_BIN_EXE_shanjie-eval"), root());
     let (lm, tl, co) = (r.join("data/lm/bigram.sjlm"), r.join("data/lm/tinylm.sjtl"), r.join("data/lm/colloquial.sjlm"));
     let sha8 = &core::eval::sha256_hex(&std::fs::read(r.join("data/lexicon/std-exempt.tsv")).unwrap())[..8];
     for profile in ["formal", "chat"] {
         let cli = |extra: &[&str]| {
-            let mut a = vec!["--lm", lm.to_str().unwrap(), "--profile", profile, "--context", "--packs", "acg,it,beauty", "--tinylm", tl.to_str().unwrap(), "--rows", rows];
+            let mut a = vec!["--lm", lm.to_str().unwrap(), "--profile", profile, "--context", "--packs", "acg,it,meme,beauty", "--tinylm", tl.to_str().unwrap(), "--rows", rows];
             if profile == "chat" {
                 a.extend(["--colloquial-core", co.to_str().unwrap()]);
             }
@@ -424,7 +446,7 @@ fn reading_decode_replay_agrees_with_the_cli() {
         let (rep_on, rep_off) = (run(replay, &["--rows", rows, "--profile", profile]), run(replay, &["--rows", rows, "--profile", profile, "--no-reading-decode"]));
         assert_eq!(sha_of(&on), sha_of(&rep_on), "{profile}: the replay's engine decodes like the CLI");
         assert_eq!(sha_of(&off), sha_of(&rep_off), "{profile}: --no-reading-decode");
-        assert!(on.contains(&format!("+rd+rx:{sha8}  {{")) && rep_on.contains(&format!("+rd+rx:{sha8}  {{")), "{profile}: {on}{rep_on}");
+        assert!(on.contains(&format!("+rd+rx:{sha8}+rm  {{")) && rep_on.contains(&format!("+rd+rx:{sha8}+rm  {{")), "{profile}: {on}{rep_on}");
         assert!(!off.contains("+rd") && !rep_off.contains("+rd") && !rep_off.contains("+rx"), "{profile}: {off}{rep_off}");
     }
     // the reading-channel switch is gone from the replay too
@@ -464,7 +486,7 @@ fn learn_file_changes_the_choice_and_the_source_is_untouched() {
     let today = core::learn::local_day();
     std::fs::write(&src, format!("#shanjie-learning v1\n^>$\tㄗㄞˋ-ㄐㄧㄢˋ\t在建\t50\t{today}\n")).unwrap();
     let (bytes, mtime) = (std::fs::read(&src).unwrap(), std::fs::metadata(&src).unwrap().modified().unwrap());
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let rows = dir.join("rows.txt");
     std::fs::write(&rows, "|再見|ㄗㄞˋ ㄐㄧㄢˋ\n").unwrap();
     let rs = dir.join("rs.txt");
@@ -497,7 +519,7 @@ fn learn_guard_counts_and_switches() {
     let src = dir.join("mine.tsv");
     let today = core::learn::local_day();
     std::fs::write(&src, format!("#shanjie-learning v1\n^>$\tㄗㄞˋ-ㄐㄧㄢˋ\t在建\t50\t{today}\n")).unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     // With --correct the re-pick fixes 再見 after the first display: a count read after the re-pick (or after Enter) would be 0.
     let default = text(&replay_with_learn(&dir, &src, &["--correct"]));
     let off = text(&replay_with_learn(&dir, &src, &["--learn-guard", "off"]));
@@ -518,7 +540,7 @@ fn sinit_flags_tag_the_summary_and_the_counters_go_to_stderr() {
     let src = dir.join("mine.tsv");
     let today = core::learn::local_day();
     std::fs::write(&src, format!("#shanjie-learning v1\n^>ㄐㄧㄢˋ\tㄗㄞˋ\t再\t1\t{today}\n")).unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let plain = replay_with_learn(&dir, &src, &["--learn", "on"]);
     let plain_out = text(&plain);
     assert!(!plain_out.contains("+level") && !plain_out.contains("sinit:"), "{plain_out}");
@@ -552,7 +574,7 @@ fn sinit_stretches_file_is_numbers_only_and_changes_no_other_output() {
     let src = dir.join("mine.tsv");
     let today = core::learn::local_day();
     std::fs::write(&src, format!("#shanjie-learning v1\n^>ㄐㄧㄢˋ\tㄗㄞˋ\t再\t1\t{today}\n")).unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let (rs0, rs1, st) = (dir.join("rs0.txt"), dir.join("rs1.txt"), dir.join("st.txt"));
     let without = text(&replay_with_learn(&dir, &src, &["--learn", "on", "--rowstats", rs0.to_str().unwrap()]));
     let with = text(&replay_with_learn(&dir, &src, &["--learn", "on", "--rowstats", rs1.to_str().unwrap(), "--sinit-stretches", st.to_str().unwrap()]));
@@ -578,7 +600,7 @@ fn a_corrupt_learn_file_is_an_error() {
     std::fs::write(&src, "not a learning file\n").unwrap();
     let out_file = dir.join("keep.rs");
     std::fs::write(&out_file, "keep").unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let out = replay_with_learn(&dir, &src, &["--rowstats", out_file.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a valid learning file"), "{}", String::from_utf8_lossy(&out.stderr));
@@ -614,7 +636,7 @@ fn an_output_that_is_the_learn_file_is_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Rule (docs/spec/evaluation.md §4): `--packs` is research only. Omitted, the summary tag is the App's `+acg+it+beauty` (since the beauty pack, docs/spec/lexicon-and-packs.md §8; before it `+acg+it`; the dev302 rows' rowstats and summary
+/// Rule (docs/spec/evaluation.md §4): `--packs` is research only. Omitted, the summary tag is the App's `+acg+it+meme+beauty` (since the beauty pack, docs/spec/lexicon-and-packs.md §8; before it `+acg+it`; the dev302 rows' rowstats and summary
 /// are byte for byte those of before the option, checked by hand when it was added); `acg,quotes,it` adds `+quotes`; a name that is not
 /// a pack is an error.
 #[test]
@@ -624,9 +646,9 @@ fn packs_option_changes_only_the_tag_it_names() {
     let rows = dir.join("rows.txt");
     std::fs::write(&rows, "|你好|ㄋㄧˇ ㄏㄠˇ\n").unwrap();
     let rows = rows.to_str().unwrap();
-    let _g = ONE_ENGINE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = slot();
     let replay = env!("CARGO_BIN_EXE_shanjie-replay");
-    assert!(run(replay, &["--rows", rows]).contains("+ctx+acg+it+beauty+nopred"));
+    assert!(run(replay, &["--rows", rows]).contains("+ctx+acg+it+meme+beauty+nopred"));
     assert!(run(replay, &["--rows", rows, "--packs", "acg,it"]).contains("+ctx+acg+it+nopred"));
     assert!(run(replay, &["--rows", rows, "--packs", "acg,quotes,it"]).contains("+ctx+acg+quotes+it+nopred"));
     assert!(run(replay, &["--rows", rows, "--packs", "acg", "--packs", "it"]).contains("+ctx+acg+it+nopred"), "repeats add up");

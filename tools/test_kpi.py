@@ -81,15 +81,55 @@ class TableRules(Tmp):
         self.assertEqual(c["v0.4.3"], "—")  # the cell has no counts
         self.assertEqual(c["v0.4.0"], "—")  # no previous version
 
-    def test_speed_only_when_load_is_low_at_both_ends(self):
-        for name, load, shown in (("a", (0.5, 2.0), True), ("b", (2.01, 0.5), False), ("c", (0.5, 2.01), False), ("d", (37.52, 31.4), False)):
+    def test_speed_only_when_load_is_low_at_the_start(self):
+        for name, load, shown in (("a", (2.0, 0.5), True), ("b", (2.01, 0.5), False), ("c", (0.5, 4.25), True), ("d", (37.52, 31.4), False)):
             self.put(self.res, f"v2-{name}.json", v2_file("2026-10-01", [v2_version("v0." + name, speed=SPEED)], load=load))
         _, rows = self.table()
         c = self.col(rows, "速度與記憶體")
-        self.assertIn("RSS 426 MB", c["v0.a"])  # exactly 2.0 still counts
+        self.assertIn("RSS 426 MB", c["v0.a"])  # exactly 2.0 at the start still counts
         self.assertEqual(c["v0.b"], "—（負載 2.01）")  # two decimals: 2.01 is not shown as the threshold itself
-        self.assertEqual(c["v0.c"], "—（負載 2.01）")
-        self.assertEqual(c["v0.d"], "—（負載 37.52）")
+        self.assertIn("RSS 426 MB", c["v0.c"])  # a high load at the end (bench's own accuracy cells) does not count against it
+        self.assertEqual(c["v0.d"], "—（負載 37.52）")  # the start's load is the one shown
+
+    def window_file(self, name, tm=(False, False), after=4.25, start=0.5, before=3.0, keys=("speed_tm_before", "speed_tm_after")):
+        """A result that recorded the machine's state around the speed measurement (bench.speed_window)."""
+        d = v2_file("2026-11-20", [v2_version("v0." + name, speed=SPEED)], load=(start, 9.0))
+        d["env"].update({"speed_load_before": before, "speed_load_after": after})
+        d["env"].update({k: v for k, v in zip(("speed_tm_before", "speed_tm_after"), tm) if k in keys})
+        self.put(self.res, f"v2-{name}.json", d)
+
+    def test_speed_by_the_window_around_the_speed_measurement(self):
+        # docs/spec/evaluation.md §8.2's table, one row each; the load at the start of the run is not looked at (37.5 here)
+        self.window_file("a", tm=(False, False), after=5.0, start=37.5)          # exactly the limit still counts
+        self.window_file("b", tm=(False, False), after=5.01)
+        self.window_file("c", tm=(True, False))                                 # backing up before
+        self.window_file("d", tm=(False, True))                                 # backing up after
+        self.window_file("e", tm=(True, False), after=9.99)                     # a backup comes first as the reason
+        self.window_file("f", tm=(None, False))                                 # unknown: the numbers, with the note
+        self.window_file("g", tm=(False, None), after=6.0)                      # unknown and over the limit: the load is the reason
+        self.window_file("h", keys=())                                          # no Time Machine fields at all: unknown
+        self.window_file("i", tm=(None, True))
+        self.window_file("j", tm=(False, False), before=40.0)                   # the load before is recorded, not judged
+        _, rows = self.table()
+        c = self.col(rows, "速度與記憶體")
+        numbers = "按鍵 p95 6.82 ms／重排 p95 23.4 ms／RSS 426 MB"
+        self.assertEqual(c["v0.a"], numbers)
+        self.assertEqual(c["v0.b"], "—（速度段後負載 5.01）")
+        self.assertEqual(c["v0.c"], "—（備份中）")
+        self.assertEqual(c["v0.d"], "—（備份中）")
+        self.assertEqual(c["v0.e"], "—（備份中）")
+        self.assertEqual(c["v0.f"], numbers + "（備份狀態未知）")
+        self.assertEqual(c["v0.g"], "—（速度段後負載 6.00）")
+        self.assertEqual(c["v0.h"], numbers + "（備份狀態未知）")
+        self.assertEqual(c["v0.i"], "—（備份中）")
+        self.assertEqual(c["v0.j"], numbers)
+
+    def test_a_result_without_the_window_fields_keeps_the_start_rule(self):
+        d = v2_file("2026-10-01", [v2_version("v0.a", speed=SPEED)], load=(2.01, 0.5))
+        d["env"].update({"speed_tm_before": False, "speed_tm_after": False, "speed_load_before": 0.1})   # not the field that selects the rule
+        self.put(self.res, "v2-a.json", d)
+        _, rows = self.table()
+        self.assertEqual(self.col(rows, "速度與記憶體")["v0.a"], "—（負載 2.01）")
 
     def test_speed_columns_split_per_machine(self):
         for name, machine in (("a", "Mac17,3"), ("b", "gcp-c4d")):
@@ -201,7 +241,7 @@ class SiteData(Tmp):
         replay = {"user-reported": {"rows_sha256": H1, "n": 80, "off": {"top1": 70, "kyss": 0.9722, "rewrites": 78, "picks_per100": 2.11, "tag": "t", "guard_rows": 1},
                                     "on": {"top1": 71, "kyss": 0.9763, "rewrites": 78, "picks_per100": 1.94}, "learn_fixed": 1, "learn_broken": 0},
                   "dev302": {"rows_sha256": H2, "n": 302, "off": {"top1": 280, "kyss": 0.9852, "rewrites": 265, "picks_per100": 1.13}}}
-        self.put(self.res, "v2-a.json", v2_file("2026-10-13", [v2_version("v0.5.0"), v2_version("v0.6.0", 82, {"fixed": 3, "broken": 1}, SPEED, lytune=60)]))
+        self.put(self.res, "v2-a.json", v2_file("2026-10-13", [v2_version("v0.5.0"), v2_version("v0.6.0", 82, {"fixed": 3, "broken": 1}, SPEED, lytune=60)], load=(0.5, 4.25)))   # busy only at the end: still counts
         self.put(self.res, "v2-b.json", v2_file("2026-10-20", [v2_version("v0.6.0"), v2_version("v0.6.1", 83, {"fixed": 2, "broken": 0}, SPEED)], load=(3.0, 0.5)))
         self.put(self.kp, "v0.6.0.json", {"replay": replay, "holdout_talk_chat": {"n": 150, "top1": 124, "rows_sha256": H1, "fixed": 0, "broken": 0, "p": 1.0},
                                            "holdout_news_formal": {"n": 150, "top1": 128, "rows_sha256": H2}, "wikitune_clean": {"n": 5, "top1": 4, "rows_sha256": H2}})
@@ -229,10 +269,38 @@ class SiteData(Tmp):
     def test_speed_follows_the_tables_load_rule(self):
         md, raw = self.table()
         j = {v["version"]: v for v in json.loads(raw)["versions"]}
-        self.assertEqual(j["v0.6.0"]["speed"], {"machine": None, "load_avg_max": 0.5, "idle": True, "p95_us": 6822.2, "rerank_p95_ms": 23.4, "rss_mb": 426.4})
-        self.assertEqual(j["v0.6.1"]["speed"], {"machine": None, "load_avg_max": 3.0, "idle": False})   # busy window: no numbers
+        self.assertEqual(j["v0.6.0"]["speed"], {"machine": None, "load_avg_start": 0.5, "idle": True, "p95_us": 6822.2, "rerank_p95_ms": 23.4, "rss_mb": 426.4})
+        self.assertEqual(j["v0.6.1"]["speed"], {"machine": None, "load_avg_start": 3.0, "idle": False})   # busy at the start: no numbers
         self.assertIn("負載 3.00", md.decode())
         self.assertIn("按鍵 p95 6.82 ms", md.decode())
+
+    def test_speed_rows_of_the_window_rule(self):
+        def window(version, date, tm, after, before=3.0, both=True):
+            d = v2_file(date, [v2_version("v0.6.1"), v2_version(version, 84, {"fixed": 1, "broken": 0}, SPEED)], load=(9.0, 9.0))
+            d["env"].update({"speed_load_before": before, "speed_load_after": after})
+            if both:
+                d["env"].update({"speed_tm_before": tm[0], "speed_tm_after": tm[1]})
+            self.put(self.res, f"v2-{version}.json", d)
+        window("v0.7.0", "2026-11-01", (False, False), 4.25)
+        window("v0.7.1", "2026-11-02", (False, True), 1.0)
+        window("v0.7.2", "2026-11-03", (False, False), 5.5)
+        window("v0.7.3", "2026-11-04", (None, False), 2.0)
+        window("v0.7.4", "2026-11-05", None, 2.0, both=False)
+        md, raw = self.table()
+        j = {v["version"]: v for v in json.loads(raw)["versions"]}
+        base = {"machine": None, "rule": "window", "speed_load_before": 3.0}
+        numbers = {"p95_us": 6822.2, "rerank_p95_ms": 23.4, "rss_mb": 426.4}
+        self.assertEqual(j["v0.7.0"]["speed"], {**base, "idle": True, "speed_load_after": 4.25, "speed_tm_before": False, "speed_tm_after": False, **numbers})
+        self.assertEqual(j["v0.7.1"]["speed"], {**base, "idle": False, "speed_load_after": 1.0, "speed_tm_before": False, "speed_tm_after": True})
+        self.assertEqual(j["v0.7.2"]["speed"], {**base, "idle": False, "speed_load_after": 5.5, "speed_tm_before": False, "speed_tm_after": False})
+        self.assertEqual(j["v0.7.3"]["speed"], {**base, "idle": True, "speed_load_after": 2.0, "speed_tm_before": None, "speed_tm_after": False, **numbers})
+        self.assertEqual(j["v0.7.4"]["speed"], {**base, "idle": True, "speed_load_after": 2.0, "speed_tm_before": None, "speed_tm_after": None, **numbers})
+        # the rows of the start rule are as they always were: no `rule` key, the load at the start
+        self.assertEqual(j["v0.6.0"]["speed"], {"machine": None, "load_avg_start": 0.5, "idle": True, **numbers})
+        self.assertEqual(j["v0.6.1"]["speed"], {"machine": None, "load_avg_start": 3.0, "idle": False})
+        text = md.decode()
+        for cell in ("—（備份中）", "—（速度段後負載 5.50）", "MB（備份狀態未知）", "—（負載 3.00）"):
+            self.assertIn(cell, text)
 
     def test_the_markdown_is_what_render_makes_of_the_same_files(self):
         md, _ = self.table()
@@ -244,6 +312,28 @@ class SiteData(Tmp):
         self.assertIn(f"{v['replay']['dev302']['off']['kyss']:.4f}", md)
         self.assertIn(f"{v['holdout_talk_chat']['top1']}/{v['holdout_talk_chat']['n']}", md)
         self.assertIn(f"{v['replay']['user-reported']['off']['top1']}/{v['replay']['user-reported']['n']}", md)
+
+    def test_the_full_table_goes_to_shanjie_tables_or_nowhere(self):
+        args = lambda out: argparse.Namespace(results=self.res, kpi=self.kp, out=out, json=self.js)
+        err = io.StringIO()
+        with mock.patch.dict(os.environ), contextlib.redirect_stderr(err):
+            os.environ.pop("SHANJIE_TABLES", None)
+            kpi.cmd_table(args(None))
+        self.assertTrue(os.path.isfile(self.js))
+        self.assertIn("kpi.md not written", err.getvalue())
+        self.assertFalse(any(f.endswith(".md") for _, _, fs in os.walk(self.td) for f in fs))
+        d = os.path.join(self.td, "tables")
+        with mock.patch.dict(os.environ, {"SHANJIE_TABLES": d}):
+            kpi.cmd_table(args(None))
+        self.assertEqual(open(os.path.join(d, "kpi.md"), encoding="utf-8").read(), kpi.render(self.res, self.kp))
+
+    def test_a_path_inside_the_repository_is_refused_before_anything_is_written(self):
+        out = os.path.join(bench.ROOT, "docs", "kpi-refused-by-test.md")   # inside the repository, never a real file
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as cm:
+            kpi.cmd_table(argparse.Namespace(results=self.res, kpi=self.kp, out=out, json=self.js))
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("inside this repository", err.getvalue())
+        self.assertFalse(os.path.exists(self.js) or os.path.exists(out))
 
 
 # ---------- replay ----------
@@ -380,6 +470,19 @@ class ReplayGit(Tmp):
         os.makedirs(os.path.join(self.repo, "eval/bench/kpi"))
         open(os.path.join(self.repo, "eval/bench/kpi/v9.9.9.json"), "w").write("{}")
         self.assertEqual(self.head(), self.first)
+
+    def test_this_versions_tracked_kpi_file_does_not_block(self):  # kpi.py run rewrote it after it was committed
+        os.makedirs(os.path.join(self.repo, "eval/bench/kpi"))
+        for v in ("v9.9.9", "v9.9.8"):
+            open(os.path.join(self.repo, f"eval/bench/kpi/{v}.json"), "w").write("{}")
+        git(self.repo, "add", "eval")
+        git(self.repo, "commit", "-q", "-m", "kpi")
+        head = git(self.repo, "rev-parse", "HEAD")
+        open(os.path.join(self.repo, "eval/bench/kpi/v9.9.9.json"), "w").write('{"wikitune_clean": {}}')
+        self.assertEqual(self.head(), head)
+        open(os.path.join(self.repo, "eval/bench/kpi/v9.9.8.json"), "w").write('{"x": 1}')
+        with self.assertRaises(SystemExit):
+            self.head()  # another version's file is a tracked change like any other
 
     def test_tracked_change_blocks(self):
         open(os.path.join(self.repo, "a.txt"), "w").write("2")
@@ -547,8 +650,8 @@ class ReplayRunWithTheColloquialTable(ReplayRun):
 
 
 class ReplayRunWithTheReadingTerm(ReplayRunWithTheColloquialTable):
-    """A version with `"reading": True` (docs/spec/decoder.md §5): its replay tag has no `+rc` and ends in `+rd+rx:<sha8 of its std-exempt.tsv>`;
-    the older tag (with `+rc`, or without the reading marks) is refused."""
+    """A version with `"reading": True` (docs/spec/decoder.md §5): its replay tag has no `+rc` and ends in `+rd+rx:<sha8 of its std-exempt.tsv>+rm`;
+    the older tag (with `+rc`, without the reading marks, or without `+rm`) is refused."""
     SPEC = dict(ReplayRunWithTheColloquialTable.SPEC, reading=True)
 
     def extra_root_files(self):
@@ -560,12 +663,12 @@ class ReplayRunWithTheReadingTerm(ReplayRunWithTheColloquialTable):
         return bench.sha_file(os.path.join(self.root, "data", "lexicon", "std-exempt.tsv"))[:8]
 
     def tag_parts(self):
-        return {"rc": "", "rd": f"+rd+rx:{self.rx8()}"}
+        return {"rc": "", "rd": f"+rd+rx:{self.rx8()}+rm"}
 
     def test_the_old_tags_are_refused(self):
         lm8, tl8, co8 = self.models["bigram.sjlm"][:8], self.models["tinylm.sjtl"][:8], self.models["colloquial.sjlm"][:8]
         base = f"replay-chat+ctx+acg+nopred+noen+lm:{lm8}+tl:{tl8}+correct+colloq:{co8}"
-        for tag in (base + "+rc", base, base + "+rc" + f"+rd+rx:{self.rx8()}", base + "+rd+rx:00000000"):
+        for tag in (base + "+rc", base, base + "+rc" + f"+rd+rx:{self.rx8()}+rm", base + "+rd+rx:00000000+rm", base + f"+rd+rx:{self.rx8()}"):
             with self.assertRaises(SystemExit, msg=tag):
                 self.replay(FAKE_TAG=tag)
 
@@ -632,7 +735,7 @@ class RunWikitune(Tmp):
 
     def test_rows_under_eval_holdout_are_refused(self):
         link = os.path.join(self.td, "innocent.txt")
-        os.symlink(os.path.join(kpi.ROOT, "eval/holdout/next/shard-2/talk.txt"), link)  # only the resolved path is looked at, nothing is read
+        os.symlink(os.path.join(kpi.ROOT, "eval/holdout/next/shard-3/talk.txt"), link)  # only the resolved path is looked at, nothing is read
         for path in (os.path.join(kpi.ROOT, "eval/holdout/talk.txt"), link):
             with self.subTest(path), mock.patch.object(kpi, "die", side_effect=SystemExit) as die, self.assertRaises(SystemExit):
                 self.run_cmd(rows=path)

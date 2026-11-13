@@ -5,7 +5,7 @@
   tools/bench.py reference [--private-root DIR]
   tools/bench.py check-static [--json FILE]
   tools/bench.py run --suite v2 <ref>... [--as VERSION] [--override-packs off] [--private-root DIR] [--legacy-repo PATH]   (docs/spec/evaluation.md §7)
-  tools/bench.py table
+  tools/bench.py table [--md FILE]
 
 `run` exports each ref with `git archive`, builds its CLI and the key replay, scores the frozen suite with that
 version's own CLI (always `--rows`, never `--dev`), compares with the previous row and writes
@@ -13,8 +13,10 @@ eval/bench/results/<label>.json. A ref that names a version released before this
 the legacy clone given by --legacy-repo (or SHANJIE_LEGACY_REPO) at the commit the table names, never from this repository. `reference` (docs/spec/evaluation.md §7.8) scores the CURRENT checkout's unigram decoder on the base
 lexicon only (`--no-overlay`, no --lm) into eval/bench/results/reference-mcbpmf.json, recomputing only when the commit or a
 fingerprint changed. `check-static` verifies that eval/bench/static/typing-test.json is consistent with itself (docs/spec/evaluation.md §7.8).
-`table` regenerates docs/benchmark.md from every results JSON (version rows), the reference row and the static section, and
-writes the public-set part of the same data to site/data/bench.json (docs/spec/evaluation.md §7.11).
+`table` writes the public-set part of every results JSON (version rows), the reference row and the static section to
+site/data/bench.json, which the site's /benchmark page draws (docs/spec/evaluation.md §7.11), and the full markdown table of the same
+data (private sets included) to --md FILE or $SHANJIE_TABLES/benchmark.md, never inside this repository; without either it writes
+only the JSON.
 `run --suite v2` measures each version with its shipped settings (VERSIONS2) and writes eval/bench/results/v2-<label>.json;
 `table` appends the suite-v2 section after the suite-v1 text (which stays byte for byte the same).
 Never reads eval/holdout/. Every private path is derived from --private-root.
@@ -205,12 +207,17 @@ class Ver:
     def build(self):
         if self.built:
             return
-        if not os.path.exists(os.path.join(self.dir, ".exported")):
+        paths = ["Cargo.toml", "Cargo.lock", "core", "cli", "data", "eval/variants.tsv"]
+        # The new repository's workspace also lists windows/* members; cargo loads every member's manifest even for `-p cli`.
+        if subprocess.run(["git", "-C", self.src, "cat-file", "-e", f"{self.sha}:windows"], capture_output=True).returncode == 0:
+            paths.append("windows")
+        # An export made before a path joined the list lacks it: export again rather than build a tree cargo cannot load.
+        if not (os.path.exists(os.path.join(self.dir, ".exported")) and all(os.path.exists(os.path.join(self.dir, p)) for p in paths)):
             shutil.rmtree(self.dir, ignore_errors=True)
             os.makedirs(self.dir)
             tarball = self.dir + ".tar"
             try:  # two steps so a failed archive can never leave a marker behind
-                sh(["git", "-C", self.src, "archive", "-o", tarball, self.sha, "Cargo.toml", "Cargo.lock", "core", "cli", "data", "eval/variants.tsv"])
+                sh(["git", "-C", self.src, "archive", "-o", tarball, self.sha, *paths])
                 sh(["tar", "-x", "-f", tarball, "-C", self.dir])
             except Exception:
                 shutil.rmtree(self.dir, ignore_errors=True)
@@ -616,7 +623,7 @@ def cmd_check_static(args):
     sys.exit(1 if errs else 0)
 
 
-# ---------- docs/benchmark.md ----------
+# ---------- the full markdown table (written outside this repository, see md_path) ----------
 def pct(r):
     if "error" in r:
         return "失敗：" + r["error"].replace("|", "/").replace("\n", " ")[:200]
@@ -833,16 +840,41 @@ def write_json(path, data):
         f.write(json.dumps(data, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
 
 
-def cmd_table(_):
+def md_path(arg, name, who="bench"):
+    """Where `table` writes a full markdown table (private sets included): `arg` (--md / --out), else $SHANJIE_TABLES/<name>,
+    else None (stderr says so). A path inside this repository is refused before anything is written: the full tables carry
+    private-set numbers and stay out of the public repository (docs/spec/evaluation.md §7.11)."""
+    tables = os.environ.get("SHANJIE_TABLES")
+    p = arg or (os.path.join(tables, name) if tables else None)
+    if p is None:
+        print(f"{who}: {name} not written: pass the file or set SHANJIE_TABLES (the full table stays out of this repository)", file=sys.stderr)
+        return None
+    p, root = os.path.realpath(p), os.path.realpath(ROOT)
+    # casefold: macOS volumes are case-insensitive, so /Users/x/SHANJIE is the same folder as /Users/x/shanjie
+    if os.path.commonpath([p.casefold(), root.casefold()]) == root.casefold():
+        print(f"{who}: {p} is inside this repository: the full table carries private-set numbers and stays out of it; "
+              "write it elsewhere (--md / --out FILE or SHANJIE_TABLES)", file=sys.stderr)
+        sys.exit(1)
+    return p
+
+
+def write_md(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def cmd_table(a):
+    md = md_path(getattr(a, "md", None), "benchmark.md")
     load = lambda p: json.load(open(p, encoding="utf-8")) if os.path.isfile(p) else None
     results = [json.load(open(os.path.join(RESULTS, f), encoding="utf-8")) for f in sorted(os.listdir(RESULTS)) if is_v1_file(f)]
     v2 = [json.load(open(os.path.join(RESULTS, f), encoding="utf-8")) for f in sorted(os.listdir(RESULTS)) if f.startswith("v2-") and f.endswith(".json")]
     ext = [json.load(open(os.path.join(EXTERNAL, f), encoding="utf-8")) for f in sorted(os.listdir(EXTERNAL)) if f.endswith(".json")] \
         if os.path.isdir(EXTERNAL) else []
     ref, static = load(os.path.join(RESULTS, REFERENCE)), load(STATIC)
-    text = render_table(results, ref, static)
-    open(os.path.join(ROOT, "docs/benchmark.md"), "w", encoding="utf-8").write(text + (render_v2(v2) if v2 else "") + (render_external(ext) if ext else ""))
     write_json(os.path.join(ROOT, "site/data/bench.json"), site_bench(results, ref, static, v2, ext))
+    if md:
+        write_md(md, render_table(results, ref, static) + (render_v2(v2) if v2 else "") + (render_external(ext) if ext else ""))
 
 
 # ---------- suite v2 (docs/spec/evaluation.md §7): each version with its shipped settings ----------
@@ -882,8 +914,8 @@ PROFILES2 = ["chat", "formal"]
 # `--colloquial-core` (as the App loads the table after the small model; the term applies in chat only) and their tag gains `+colloq:{co8}+rc` (the first 8 hex
 # of the table) at the end. Formal cells and the anchor run are as without it; a version without the key is unchanged.
 # A version that ships the decoder's reading term (docs/spec/decoder.md §5; its data/lexicon/std-exempt.tsv is in the export) has `"reading": True`: the CLI
-# then ends EVERY setting's tag (chat, formal, the anchor run, the replay-setting cell) with `+rd+rx:{rx8}` (the first 8 hex of that file) and no longer marks the colloquial
-# tag with `+rc` (the reading-channel term was removed with it). The row of the new version is added at its release; a version without the key keeps `+rc` and no `+rd`.
+# then ends EVERY setting's tag (chat, formal, the anchor run, the replay-setting cell) with `+rd+rx:{rx8}+rm` (the first 8 hex of that file, then the reading-mass rule's mark) and no longer marks the colloquial
+# tag with `+rc` (the reading-channel term was removed with it). The row of the new version is added at its release (a checkout that has the reading-mass rule, docs/spec/decoder.md §5); a version without the key keeps `+rc` and no `+rd`.
 # The App also learns locally, re-ranks asynchronously after every key, takes the context from the text field: the CLI does none of that.
 VERSIONS2 = {
     "v0.4.0": {"release": "v0.4.0", "flags": ["--context", "--packs", "acg"], "tinylm": False, "tag": "+ctx+acg"},
@@ -907,6 +939,11 @@ VERSIONS2 = {
     # and tags are v0.6.0's (copied from a CLI summary line on typing76 at 9c88b87f).
     "v0.6.1": {"release": "v0.6.1", "flags": ["--context", "--packs", "acg,it"], "tinylm": True, "kn": True, "tri": True, "tri_chat": True, "colloquial": True,
                "tag": "+ctx+kn:{kn8}:θ1:β1+tl:{tl8}+acg+it+tri:{trichat8}", "formal_tag": "+ctx+kn:{kn8}:θ1:β0.75+tl:{tl8}+acg+it+tri:{tri8}"},
+    # v0.7.0: v0.6.1's n-gram models with 會意 SJ-SR-8-15M (data/models.tsv), the beauty pack on by default (Shell.swift beautyPackOn = true, App mask 21) and the decoder's reading term
+    # (docs/spec/decoder.md §5, with the reading-mass rule), which ends every tag with +rd+rx:{rx8}+rm and drops the colloquial tag's +rc (copied from CLI summary lines on typing76).
+    "v0.7.0": {"release": "v0.7.0", "flags": ["--context", "--packs", "acg,it,beauty"], "tinylm": True, "kn": True, "tri": True, "tri_chat": True, "colloquial": True,
+               "reading": True,
+               "tag": "+ctx+kn:{kn8}:θ1:β1+tl:{tl8}+acg+it+beauty+tri:{trichat8}", "formal_tag": "+ctx+kn:{kn8}:θ1:β0.75+tl:{tl8}+acg+it+beauty+tri:{tri8}"},
 }
 # Anchor (docs/spec/evaluation.md §7.7): S7h's measurement, `--override-packs off`, chat, the CLI's own variants table.
 ANCHOR = {
@@ -1005,8 +1042,8 @@ def colloq_tag(ver, prof):
 
 
 def reading_tag(ver):
-    """`+rd+rx:<sha8 of std-exempt.tsv>`, the last mark of every setting's tag of a `"reading"` version (docs/spec/decoder.md §5), else ""."""
-    return f"+rd+rx:{ver.rx8}" if getattr(ver, "rx8", "") else ""
+    """`+rd+rx:<sha8 of std-exempt.tsv>+rm`, the last marks of every setting's tag of a `"reading"` version (docs/spec/decoder.md §5; `+rm` is the reading-mass rule), else ""."""
+    return f"+rd+rx:{ver.rx8}+rm" if getattr(ver, "rx8", "") else ""
 
 
 def expected_tag(ver, prof, anchor):
@@ -1160,6 +1197,36 @@ def measure_speed2(ctx, vers):
     return out
 
 
+def tm_running():
+    """Whether Time Machine is backing up now: True or False from `tmutil status` (`Running = 1`), None when it cannot be told (not
+    macOS, tmutil missing, failing or not answering in 30 s). docs/spec/evaluation.md §7.5."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(["tmutil", "status"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode:
+        return None
+    return bool(re.search(r"^\s*Running = 1;", r.stdout, re.M))
+
+
+def load1():
+    return os.getloadavg()[0]
+
+
+def speed_window(ctx, vers, measure=None, tm=tm_running, load=load1):
+    """The speed measurement with the machine's state read right before and right after it (docs/spec/evaluation.md §7.5): the 1-minute
+    load and whether Time Machine is backing up. Returns (what `measure_speed2` returns, the four fields for the result's machine block).
+    Without dev302 nothing is measured or read: ({}, {}). tools/kpi.py judges the speed column by these fields (§8.2)."""
+    if "dev302" not in ctx.files:
+        return {}, {}
+    before = (load(), tm())
+    speed = (measure or measure_speed2)(ctx, vers)
+    after = (load(), tm())
+    return speed, {"speed_load_before": before[0], "speed_tm_before": before[1], "speed_load_after": after[0], "speed_tm_after": after[1]}
+
+
 def preflight2(args):
     ctx = Ctx()
     if sha_file(VARIANTS) != VARIANTS_SHA:
@@ -1259,7 +1326,7 @@ def cmd_run2(args):
             fixed = sum(a and not b for a, b in zip(new, old))
             broken = sum(b and not a for a, b in zip(new, old))
             rec["vs_prev"][cell] = {"fixed": fixed, "broken": broken, "p": mcnemar(fixed, broken)}
-    speed = measure_speed2(ctx, vers) if "dev302" in ctx.files else {}
+    speed, window = speed_window(ctx, vers)
     for rec, v in zip(result["versions"], vers):
         rec["speed"] = speed.get(v.sha, {"error": "no dev302"})
         for part, sp in (("", rec["speed"]), (" formal", rec["speed"].get("formal", {}))):
@@ -1268,7 +1335,7 @@ def cmd_run2(args):
                 print(f"bench: {v.label}{part}: {sp['error']}", file=sys.stderr)
     td.cleanup()
     result["env"] = {"machine": sh(["sysctl", "-n", "hw.model"]).strip(), "macos": platform.mac_ver()[0],
-                     "cargo": sh(["cargo", "--version"]).strip(), "load_avg_start": load0, "load_avg_end": os.getloadavg()[0]}
+                     "cargo": sh(["cargo", "--version"]).strip(), "load_avg_start": load0, "load_avg_end": os.getloadavg()[0], **window}
     os.makedirs(RESULTS, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=1)
@@ -1339,7 +1406,8 @@ def main():
     r.add_argument("--as", dest="as_", help="suite v2: settings-table version for the last ref (a commit without a tag yet)")
     r.add_argument("--override-packs", choices=["off"], help="suite v2: drop --packs acg and check S7h's anchor (nothing is written)")
     add_legacy_arg(r)
-    sub.add_parser("table")
+    t = sub.add_parser("table")
+    t.add_argument("--md", help="where to write the full table (default $SHANJIE_TABLES/benchmark.md; never inside this repository)")
     rf = sub.add_parser("reference")
     rf.add_argument("--private-root", default=DEFAULT_PRIVATE)
     cs = sub.add_parser("check-static")

@@ -177,7 +177,7 @@ public final class MemoryDemoteStore: DemoteStore {
 @MainActor
 public protocol PredictionStore: AnyObject {
     var prediction: Bool? { get set }
-    /// docs/spec/prediction.md §9.4: whether browsers hide the row for the first syllable; `nil` is on.
+    /// docs/spec/prediction.md §9.4: whether browsers hide the row for the first syllable; `nil` is off (it was on before Chrome 157 placed it right).
     var browserFirstSyllable: Bool? { get set }
 }
 
@@ -316,6 +316,19 @@ public protocol BeautyPackStore: AnyObject {
 public final class MemoryBeautyPackStore: BeautyPackStore {
     public var beautyPack: Bool?
     public init(_ beautyPack: Bool? = nil) { self.beautyPack = beautyPack }
+}
+
+/// Where the "迷因與實況用語" switch is kept (docs/spec/lexicon-and-packs.md §4.2, §9.3): `nil` means never chosen, which is on. Same arrangement as `BeautyPackStore`.
+@MainActor
+public protocol MemePackStore: AnyObject {
+    var memePack: Bool? { get set }
+}
+
+/// The in-memory MemePackStore.
+@MainActor
+public final class MemoryMemePackStore: MemePackStore {
+    public var memePack: Bool?
+    public init(_ memePack: Bool? = nil) { self.memePack = memePack }
 }
 
 /// Where the candidate glass tint slider is kept (docs/spec/macos-shell.md §8.7): 0...1,
@@ -520,9 +533,9 @@ public final class Shell {
     ]
     static let chat: UInt32 = 0, formal: UInt32 = 1
 
-    /// Chromium browsers (docs/spec/prediction.md §9.3): Google Docs answers an input method's first
-    /// rectangle query with the view's origin, so the prediction row is not shown for the first syllable there. Crest and
-    /// Aside were added with bundle IDs read off a machine.
+    /// Chromium browsers (docs/spec/prediction.md §9.3): on Chrome 156 and earlier Google Docs answers an input method's first
+    /// rectangle query with the view's origin, so with `browserFirstSyllableOn` (off by default since Chrome 157 places it right)
+    /// the prediction row is not shown for the first syllable there. Crest and Aside were added with bundle IDs read off a machine.
     static let browserApps: Set<String> = [
         "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.dev", "com.google.Chrome.canary",
         "org.chromium.Chromium",
@@ -574,8 +587,8 @@ public final class Shell {
     private let predictionStore: PredictionStore
     /// V3: whether the prediction row is computed (default on); sent to every engine `build()` makes.
     private(set) var predictionOn = true
-    /// docs/spec/prediction.md §9.4: hide the passive prediction row for the first syllable in `browserApps` (default on).
-    private(set) var browserFirstSyllableOn = true
+    /// docs/spec/prediction.md §9.4: hide the passive prediction row for the first syllable in `browserApps` (default off; for Chrome 156 and earlier).
+    private(set) var browserFirstSyllableOn = false
     private let abbreviationStore: AbbreviationStore
     /// docs/spec/prediction.md §6: the abbreviation composer (default off); sent to every engine `build()` makes, next to the prediction switch.
     private(set) var abbreviationOn = false
@@ -623,20 +636,24 @@ public final class Shell {
     private let beautyPackStore: BeautyPackStore
     /// The beauty and skincare word pack (default on, docs/spec/lexicon-and-packs.md §4.2, §8.3): parsed into the lexicon like the IT pack, so a change rebuilds the engine.
     private(set) var beautyPackOn = true
+    private let memePackStore: MemePackStore
+    /// The meme and livestream slang pack (default on, docs/spec/lexicon-and-packs.md §4.2, §9.3): parsed into the lexicon like the beauty pack, so a change rebuilds the engine.
+    private(set) var memePackOn = true
     /// The packs in the settings order: mask bit, file in the packs directory, menu title. `packMask`, the missing-file check and the menu line all read this.
     private static let packTable: [(bit: UInt32, file: String, title: String)] = [
         (CoreEngine.packACG, "acg-add.tsv", MenuEntry.Text.acgPack),
         (CoreEngine.packQuotes, "quotes-add.tsv", MenuEntry.Text.quotePack),
         (CoreEngine.packIT, "it-add.tsv", MenuEntry.Text.itPack),
         (CoreEngine.packBeauty, "beauty-add.tsv", MenuEntry.Text.beautyPack),
+        (CoreEngine.packMeme, "meme-add.tsv", MenuEntry.Text.memePack),
     ]
     /// The mask `build()` passes to `shanjie_engine_new_packs`: one bit per switch that is on. The quote switch never chosen is off and the
-    /// IT and beauty switches never chosen are on, so an app that never touched any builds with the ACG, IT and beauty bits.
-    var packMask: UInt32 { (acgPackOn ? CoreEngine.packACG : 0) | (quotePackOn ? CoreEngine.packQuotes : 0) | (itPackOn ? CoreEngine.packIT : 0) | (beautyPackOn ? CoreEngine.packBeauty : 0) }
+    /// IT, beauty and meme switches never chosen are on, so an app that never touched any builds with the ACG, IT, meme and beauty bits (29).
+    var packMask: UInt32 { (acgPackOn ? CoreEngine.packACG : 0) | (quotePackOn ? CoreEngine.packQuotes : 0) | (itPackOn ? CoreEngine.packIT : 0) | (memePackOn ? CoreEngine.packMeme : 0) | (beautyPackOn ? CoreEngine.packBeauty : 0) }
     /// The pack bits the current engine was really built with (docs/spec/lexicon-and-packs.md §4.2, §4.3): `packMask` when that build worked, less the bits
-    /// whose file is missing (the core loads nothing for them); 0 after the pack-less retry and 0 with no engine. The menu's 已開啟的詞包 line reads this, never the stored choices.
+    /// whose file is missing (the core loads nothing for them); 0 after the pack-less retry and 0 with no engine. The menu's 已開啟的詞包 section reads this, never the stored choices.
     private(set) var loadedPackMask: UInt32 = 0
-    /// The names of the loaded packs in the settings order, for the menu line.
+    /// The names of the loaded packs in the settings order, one line each in the menu's 已開啟的詞包 section.
     var loadedPackTitles: [String] {
         Shell.packTable.compactMap { loadedPackMask & $0.bit != 0 ? $0.title : nil }
     }
@@ -655,6 +672,8 @@ public final class Shell {
     /// Set by the app: opens the settings window on the 選字 page (the notice's 打開設定 button).
     public var onOpenCandidateSettings: (() -> Void)?
     var shiftTap = ShiftTap()
+    /// docs/spec/macos-shell.md §13: the in-memory diagnostic log of the Shift toggle.
+    public let diag: DiagLog
     /// Seconds since the latest mouse-button press (left, right, other) in this login session; a test replaces it. No permission needed.
     var mouseAgo: () -> TimeInterval = {
         [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown]
@@ -702,7 +721,7 @@ public final class Shell {
     private var rerankRunning: RunningRerank?
     /// docs/spec/keys-and-composition.md §7.3: the longest Enter waits for the rerank (ms), in total. 33 to 84 ms was the last job's
     /// time in PUNCT-0's VM measurement, so the limit is above the largest; on the Mac dev302's per-row p95 is
-    /// 12.6 ms. PLAN A3/A7's exception: only Enter waits, and only while a job of this session runs or is queued.
+    /// 12.6 ms. The exception §7.3 makes: only Enter waits, and only while a job of this session runs or is queued.
     static let ENTER_RERANK_WAIT_MS = 100
     /// The limit `Session.handle` uses on Enter; the tests replace it (the real-queue test gives it 10 s, the shipping value is asserted apart).
     var enterRerankWaitMS = Shell.ENTER_RERANK_WAIT_MS
@@ -851,6 +870,7 @@ public final class Shell {
     /// `quotePackStore`: the classic quote pack switch (docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2). Required, like `acgPackStore`.
     /// `itPackStore`: the IT+AI word pack switch (docs/spec/lexicon-and-packs.md §4.2, §4.3). Defaults to an in-memory store so the many test rigs need not name it; the app passes its own.
     /// `beautyPackStore`: the beauty and skincare word pack switch (docs/spec/lexicon-and-packs.md §4.2, §8.3). Defaults to an in-memory store like `itPackStore`; the app passes its own.
+    /// `memePackStore`: the meme and livestream slang pack switch (docs/spec/lexicon-and-packs.md §4.2, §9.3). Defaults to an in-memory store like `beautyPackStore`; the app passes its own.
     /// `glassTintStore`: the candidate glass tint (docs/spec/macos-shell.md §8.7). Required, like `demoteStore`.
     /// `candidateOrientationStore`: the candidate window's orientation (docs/spec/macos-shell.md §8.6.1). Required, like `glassTintStore`.
     /// `rerankStore`: the 語意校正 switch (docs/spec/semantic-rerank.md §8.2). Required, like `predictionStore`.
@@ -865,6 +885,7 @@ public final class Shell {
     /// `spacingStore`: the 中英文之間自動加空格 switch (docs/spec/english-mixed.md §9, §11). Required, with no default, like the other stores.
     /// `shiftToggleStore`, `shiftHint`: the 單按 Shift 切換中英 switch and its 英/中 hint window (docs/spec/keys-and-composition.md §9.1, §9.4). The defaults (in
     /// memory, no window) are for the tests; the app passes its own.
+    /// `diagLogStore`: the 記錄偶發問題的診斷資料 switch (docs/spec/macos-shell.md §13); the default (in memory, on) is for the tests.
     /// `englishNoticeStore`, `englishNotice`: the one-time explanation window of the English defaults change and whether it is still owed
     /// (docs/spec/english-mixed.md §10.3). The defaults (in memory, not owed, no window) are for the tests; the app passes its own.
     /// `showsAbbreviation`: whether the abbreviation switch is offered. The default `true` is for the tests; the app passes `false`
@@ -882,11 +903,14 @@ public final class Shell {
                 spacingStore: SpacingStore,
                 itPackStore: ItPackStore = MemoryItPackStore(),
                 beautyPackStore: BeautyPackStore = MemoryBeautyPackStore(),
+                memePackStore: MemePackStore = MemoryMemePackStore(),
                 shiftToggleStore: ShiftToggleStore = MemoryShiftToggleStore(),
                 shiftHint: ShiftHintPanel? = nil,
                 englishNoticeStore: EnglishNoticeStore = MemoryEnglishNoticeStore(),
-                englishNotice: EnglishNoticePanel? = nil) {
+                englishNotice: EnglishNoticePanel? = nil,
+                diagLogStore: DiagLogStore = MemoryDiagLogStore()) {
         self.resources = resources
+        diag = DiagLog(store: diagLogStore)
         self.shiftToggleStore = shiftToggleStore
         shiftToggleOn = shiftToggleStore.shiftToggle ?? false // docs/spec/english-mixed.md §10.1: was true
         self.shiftHint = shiftHint
@@ -911,7 +935,7 @@ public final class Shell {
         demoteOn = demoteStore.demote ?? true
         self.predictionStore = predictionStore
         predictionOn = predictionStore.prediction ?? true
-        browserFirstSyllableOn = predictionStore.browserFirstSyllable ?? true
+        browserFirstSyllableOn = predictionStore.browserFirstSyllable ?? false
         self.abbreviationStore = abbreviationStore
         self.showsAbbreviation = showsAbbreviation
         abbreviationOn = showsAbbreviation && abbreviationStore.abbreviation == true
@@ -945,6 +969,8 @@ public final class Shell {
         itPackOn = itPackStore.itPack ?? true
         self.beautyPackStore = beautyPackStore
         beautyPackOn = beautyPackStore.beautyPack ?? true
+        self.memePackStore = memePackStore
+        memePackOn = memePackStore.memePack ?? true
         // The preference is read before the one engine is built (about 240 MB): building first
         // and switching after would build twice.
         mode = layoutStore.layout.flatMap(InputMode.init(rawValue:)) ?? .standard
@@ -1316,6 +1342,17 @@ public final class Shell {
         Log.shell.debug("beauty pack switched")
     }
 
+    /// The settings switch (docs/spec/lexicon-and-packs.md §4.2, §9.3): the same as `setBeautyPack` for the meme and livestream slang pack.
+    func setMemePack(_ on: Bool) {
+        guard on != memePackOn else { return }
+        commitThenRebuild {
+            memePackOn = on
+            memePackStore.memePack = on
+        }
+        changed()
+        Log.shell.debug("meme pack switched")
+    }
+
     /// Whether the core records the shadow and has an English run to keep a composition in (its `shadow_on()`): English mixing on, the
     /// standard layout and the abbreviation composer off. Without it a switch to English first sends the composition (docs/spec/keys-and-composition.md §9.2).
     var shadowOn: Bool { englishOn && mode == .standard && !abbreviationOn }
@@ -1329,6 +1366,7 @@ public final class Shell {
             shiftTap = ShiftTap()
             if let o = owner { o.pushAscii(false) } else if engineAscii {
                 engineAscii = false
+                diag.record(.ascii(bundle: "-", english: false))
                 dropOnFailure(engine?.setAscii(false))
             }
         }
@@ -1354,18 +1392,27 @@ public final class Shell {
             // it works, and free it at once (build() keeps one engine at a time): if it fails too the cause is not a pack, both codes are logged
             // and these two builds are all there are. (b) Otherwise a pack is broken: for each enabled pack in the settings order build with just
             // that pack dropped (mask & ~bit); the first success wins, so the healthy packs stay on. (c) If no single drop works (two broken
-            // files), build the no-pack engine again. The stored choices are untouched and nothing is shown; the next rebuild tries the packs again.
+            // files), build the no-pack engine again. Only packs whose file is there are tried (a missing file contributes nothing, so dropping it
+            // cannot help); with a single such pack there is no drop to try, and the probe is kept as the engine instead of being freed and built a
+            // third time. The stored choices are untouched and nothing is shown; the next rebuild tries the packs again.
             let packCode = code
             built = 0
+            let live = mask & present
+            let drops = Shell.packTable.map(\.bit).filter { live & $0 != 0 && live & ~$0 != 0 }
             var noPackWorks = false
+            var keptProbe: CoreEngine?
             do {
                 let (probe, probeCode) = makeEngine(packsDir: nil, packs: 0)
                 noPackWorks = probe != nil
                 code = probeCode
-            }   // the probe engine is freed here
-            if noPackWorks {
+                if drops.isEmpty { keptProbe = probe }
+            }   // otherwise the probe engine is freed here, before any drop is built (one engine at a time)
+            if let probe = keptProbe {
+                made = probe
+                Log.shell.error("shanjie_engine_new_packs failed, code \(packCode); built with packs mask 0")
+            } else if noPackWorks {
                 var kept: UInt32 = 0
-                for bit in Shell.packTable.map(\.bit) where mask & bit != 0 && mask & ~bit != 0 {
+                for bit in drops {
                     let (dropped, _) = makeEngine(packsDir: packsDir, packs: mask & ~bit)
                     if let dropped {
                         made = dropped
@@ -1599,9 +1646,10 @@ public final class Session {
         }
         // docs/spec/english-mixed.md §10.3: the key is handled as usual first; the window (when armed) shows after it.
         defer { shell.showEnglishNoticeIfArmed(caret: currentLineRect()) }
-        shell.shiftTap.keyDown()  // docs/spec/keys-and-composition.md §9.1: a key between Shift's press and release spoils the tap
+        shell.shiftTap.keyDown(shiftHeld: event?.modifierFlags.contains(.shift) ?? false)  // docs/spec/keys-and-composition.md §9.1: a key between Shift's press and release spoils the tap
         if claim() {
             let bundle = client.bundleIdentifier  // a synchronous IPC: read once for both
+            shell.diag.record(.owner(bundle: DiagLog.clean(bundle)))
             applyProfile(bundle: bundle)
             syncAscii(bundle: bundle)
             shell.lastTypingAt = nil  // docs/spec/english-mixed.md §11: an owner change without activateServer counts too
@@ -1664,10 +1712,14 @@ public final class Session {
         let hasDevice = raw & 0x6 != 0
         let leftDown = hasDevice ? raw & 0x2 != 0 : generic && event.keyCode == 56
         let rightDown = hasDevice ? raw & 0x4 != 0 : generic && event.keyCode == 60
-        if shell.shiftTap.flagsChanged(keyCode: event.keyCode, leftDown: leftDown, rightDown: rightDown, others: others, capsLock: flags.contains(.capsLock),
-                                       now: event.timestamp, processedAt: shell.uptime(), mouseAgo: shell.mouseAgo) {
-            toggleAscii()
+        let outcome = shell.shiftTap.event(keyCode: event.keyCode, leftDown: leftDown, rightDown: rightDown, others: others,
+                                           capsLock: flags.contains(.capsLock), now: event.timestamp, processedAt: shell.uptime(),
+                                           mouseAgo: shell.mouseAgo)
+        // docs/spec/macos-shell.md §13.1: never during secure input (each Shift would tell how many characters of a password needed it).
+        if let outcome, shell.diag.enabled, !shell.isSecureInput() {
+            shell.diag.record(.shift(right: event.keyCode == 60, outcome: outcome))
         }
+        if outcome == .toggled { toggleAscii() }
         return false
     }
 
@@ -1675,14 +1727,18 @@ public final class Session {
     /// is sent first. The hint shows which one (docs/spec/keys-and-composition.md §9.4).
     private func toggleAscii() {
         let bundle = client.bundleIdentifier  // a synchronous IPC: read once
-        if claim() { applyProfile(bundle: bundle) }
+        if claim() {
+            shell.diag.record(.owner(bundle: DiagLog.clean(bundle)))
+            applyProfile(bundle: bundle)
+        }
         let app = asciiApp(bundle)
         let on = !shell.asciiApps.contains(app)
         if on && shell.composing && !shell.shadowOn { finish(mode: 0) }
         if on { shell.asciiApps.insert(app) } else { shell.asciiApps.remove(app) }
         pushAscii(on)
         shell.lastTypingAt = shell.idleClock()  // docs/spec/english-mixed.md §11: this hint already shows the mode
-        showShiftHint(on ? "英" : "中")
+        let shown = showShiftHint(on ? "英" : "中")
+        shell.diag.record(.toggle(bundle: DiagLog.clean(bundle), english: on, hintShown: shown))
     }
 
     /// docs/spec/english-mixed.md §11: a key that types: what `asciiKey` takes (no Control, Option, Command or Caps Lock, one character
@@ -1712,6 +1768,7 @@ public final class Session {
     func pushAscii(_ on: Bool) {
         guard on != shell.engineAscii, let engine = shell.engine else { return }
         shell.engineAscii = on
+        shell.diag.record(.ascii(bundle: DiagLog.clean(knownBundle), english: on))
         switch engine.setAscii(on) {
         case .ok(let o): apply(o)
         case .failed(let c): _ = fail(c)
@@ -1719,11 +1776,13 @@ public final class Session {
     }
 
     /// docs/spec/keys-and-composition.md §9.4: the hint above the cursor line: the marked text's rectangle while composing, the insertion point's otherwise. No
-    /// rectangle, no hint (not the screen corner, not the last place).
-    private func showShiftHint(_ text: String) {
-        guard let panel = shell.shiftHint else { return }
-        guard let rect = currentLineRect() else { return }
+    /// rectangle, no hint (not the screen corner, not the last place). Returns whether it was shown (docs/spec/macos-shell.md §13.1).
+    @discardableResult
+    private func showShiftHint(_ text: String) -> Bool {
+        guard let panel = shell.shiftHint else { return false }
+        guard let rect = currentLineRect() else { return false }
         panel.show(text, lineRect: rect, appearance: client.appearance, glassTint: shell.glassTint)
+        return true
     }
 
     /// The marked text's rectangle while composing, the insertion point's otherwise; `nil` when the client gives none.
@@ -1733,10 +1792,12 @@ public final class Session {
 
     /// docs/spec/macos-shell.md §2.2 order: ownership first, then the profile for this client's app.
     public func activate() {
-        claim()
+        let claimed = claim()
         let bundle = client.bundleIdentifier
+        if claimed { shell.diag.record(.owner(bundle: DiagLog.clean(bundle))) }
         applyProfile(bundle: bundle)
         syncAscii(bundle: bundle)
+        shell.diag.record(.activate(bundle: DiagLog.clean(bundle), owner: shell.owner === self, english: shell.engineAscii))
         shell.lastTypingAt = nil  // docs/spec/english-mixed.md §11: the next typing key shows the mode (only while the toggle is on)
         shell.armEnglishNotice()  // docs/spec/english-mixed.md §10.3
     }
@@ -1745,6 +1806,8 @@ public final class Session {
     public func deactivate() {
         spacingPrev = nil
         shell.hideEnglishNotice()  // docs/spec/english-mixed.md §10.3: any deactivate, owner or not, only hides the window
+        // docs/spec/macos-shell.md §13.1: no bundle read here; the one this session last read.
+        shell.diag.record(.deactivate(bundle: DiagLog.clean(bundle), owner: shell.owner === self, english: shell.engineAscii))
         guard shell.owner === self else { return }
         // Never send the composition into a field that has just turned secure.
         if shell.composing { finish(mode: shell.isSecureInput() ? 1 : 0) }
@@ -1929,7 +1992,7 @@ public final class Session {
     func toggleAppChat() {
         guard let bundle = client.bundleIdentifier, !bundle.isEmpty, shell.profileMode == .auto else { return }
         shell.setAppProfile(bundle, profile(for: bundle) == Shell.chat ? Shell.formal : Shell.chat)
-        claim()
+        if claim() { shell.diag.record(.owner(bundle: DiagLog.clean(bundle))) }
         applyProfile(bundle: bundle)
         shell.changed()
     }

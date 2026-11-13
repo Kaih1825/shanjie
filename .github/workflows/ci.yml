@@ -78,8 +78,9 @@ jobs:
     # docs/spec/release-and-ci.md: the release tests of both packages (the shipping profile, with the per-key p95 assertions and the
     # f64 goldens made on macOS); the C header smoke test is in `swift`. The debug run is the `debug` job and the Python steps the `python` job, both on Linux.
     runs-on: xcode-27
-    # A hung FFI child process should not hold the runner for the 6-hour default.
-    timeout-minutes: 20
+    # A hung FFI child process should not hold the runner for the 6-hour default. The release tests took 16.3-18.5 min on main
+    # (2026-11-09) and one run was cancelled at 20 min, so the limit leaves room above that.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -141,9 +142,14 @@ jobs:
       - name: Tests (debug, cli unit tests)
         run: cargo test --locked -p cli --lib --bins
 
+      # docs/spec/windows-tip.md §5.10: the wire format of the Windows client and host is plain Rust and is tested on every
+      # platform (macOS runs it in the `core` job's workspace test, Windows in the `windows` job).
+      - name: Tests (debug, Windows wire format)
+        run: cargo test --locked -p shanjie-win-proto
+
       # docs/spec/windows-tip.md §2.9: the Linux side of the Windows comparison. The evaluation CLI in release, the six rowstats
       # (dev302, the typing test and the user-reported rows, chat and formal) with the shipping flags, and the files as an artifact for the
-      # `windows` job to compare byte for byte (scripts/ci-rowstats.sh is the one copy of the six commands). Both sides run Rust 1.97.1.
+      # `rowstats` job to compare byte for byte with the `windows` job's (scripts/ci-rowstats.sh is the one copy of the six commands). Both sides run Rust 1.97.1.
       - name: Evaluation CLI (release)
         run: cargo build --release --locked -p cli --bin shanjie-eval
 
@@ -158,11 +164,12 @@ jobs:
           retention-days: 1
 
   # docs/spec/windows-tip.md §2.9: the core on x86_64-pc-windows-msvc. The tests pass (minus the per-key p95 assertions, which a
-  # 4 vCPU runner cannot measure and which the Linux and macOS jobs keep), the evaluation CLI's six rowstats equal the Linux job's byte for
-  # byte, the checkout has LF line endings where the data and tests need them, and the core also builds for i686 and aarch64 (build only).
-  # Needs `debug` for its rowstats artifact; skipped exactly when `core` is. Every step runs in bash (Git Bash on the runner), not PowerShell.
+  # 4 vCPU runner cannot measure and which the Linux and macOS jobs keep), the evaluation CLI's six rowstats go up as an artifact for the
+  # `rowstats` job, the checkout has LF line endings where the data and tests need them, and the core also builds for i686 and aarch64 (build only).
+  # Starts beside the other jobs (the comparison with `debug` is the `rowstats` job); skipped exactly when `core` is. Every step runs in bash
+  # (Git Bash on the runner), not PowerShell. core/tests/engine_cap.rs runs in `windows-cap` beside it.
   windows:
-    needs: [changes, debug]
+    needs: changes
     if: needs.changes.outputs.run == 'true'
     runs-on: windows-2025
     timeout-minutes: 45
@@ -186,18 +193,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/fetch-models.sh
 
-      # The seven tests that assert a per-key p95 under 16 ms in release (a 4 vCPU runner measures them wrongly; the 188 WSL run skips them for
-      # the same reason). Their selection assertions run in the Linux and macOS jobs.
-      - name: Tests (release, core package)
-        run: >-
-          cargo test -p core --release --locked --
-          --skip replay_standard_chat_production_path
-          --skip replay_standard_302_of_302
-          --skip replay_eten_302_of_302
-          --skip replay_with_english_on
-          --skip replay_with_english_on_and_the_revert_switches_off
-          --skip replay_with_english_and_digits_on
-          --skip perf_two_thousand_new_words_per_key
+      # Every core test target but core/tests/engine_cap.rs (the `windows-cap` job), listed from the file names so that a new test file
+      # runs here without an edit (core has no [[test]] renames, examples or benches, so a file stem is its target name); then the doc tests.
+      # The seven tests that assert a per-key p95 under 16 ms in release are skipped (a 4 vCPU runner measures them wrongly; the 188 WSL run
+      # skips them for the same reason). Their selection assertions run in the Linux and macOS jobs.
+      - name: Tests (release, core package, all but engine_cap)
+        run: |
+          set -euo pipefail
+          targets=()
+          n=0
+          for f in core/tests/*.rs; do
+            n=$((n + 1))
+            t=$(basename "$f" .rs)
+            [ "$t" = engine_cap ] || targets+=(--test "$t")
+          done
+          [ "${#targets[@]}" -gt 0 ] && [ "${#targets[@]}" -eq $(( (n - 1) * 2 )) ] || { echo "error: ${#targets[@]} target arguments for $n test files" >&2; exit 1; }
+          cargo test -p core --release --locked --lib --bins "${targets[@]}" -- \
+            --skip replay_standard_chat_production_path \
+            --skip replay_standard_302_of_302 \
+            --skip replay_eten_302_of_302 \
+            --skip replay_with_english_on \
+            --skip replay_with_english_on_and_the_revert_switches_off \
+            --skip replay_with_english_and_digits_on \
+            --skip perf_two_thousand_new_words_per_key
+          cargo test -p core --release --locked --doc
 
       - name: Evaluation CLI (release)
         run: cargo build --release --locked -p cli --bin shanjie-eval
@@ -205,22 +224,12 @@ jobs:
       - name: Evaluation rowstats
         run: scripts/ci-rowstats.sh rowstats-windows
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rowstats-linux
-          path: rowstats-linux
-
-      # docs/spec/windows-tip.md §2.9: the six files are the Linux job's, byte for byte.
-      - name: Rowstats equal the Linux job's
-        run: |
-          set -euo pipefail
-          n=0
-          for f in rowstats-linux/*.rowstats; do
-            cmp "$f" "rowstats-windows/$(basename "$f")"
-            n=$((n + 1))
-          done
-          [ "$n" -eq 6 ] || { echo "error: $n Linux rowstats files, not 6" >&2; exit 1; }
-          [ "$(ls rowstats-windows | wc -l)" -eq 6 ] || { echo "error: not 6 Windows rowstats files" >&2; exit 1; }
+          name: rowstats-windows
+          path: rowstats-windows
+          if-no-files-found: error
+          retention-days: 1
 
       # docs/spec/windows-tip.md §2.7: no CRLF in the working tree (a CRLF in digits.tsv switches the digit layer off without a message).
       # `git ls-files --eol` prints `i/<index> w/<working tree> attr/...`: no `w/crlf` or `w/mixed`, and every `i/lf` file is `w/lf`.
@@ -242,16 +251,130 @@ jobs:
           cargo build --locked -p core --target i686-pc-windows-msvc
           cargo build --locked -p core --target aarch64-pc-windows-msvc
 
-      # docs/spec/windows-tip.md §3.13: the text service DLL builds (without and with the `timing` feature), then its unit tests and the
-      # R2 behaviour tests run. COM and TSF themselves are covered by the VM run (docs/spec/windows-tip.md §3.13), not here.
-      - name: shanjie-tip builds (release, without and with timing)
+      # docs/spec/windows-tip.md §3.13 and §5.10: the text service DLL and the resident host build (each without
+      # and with the `timing` feature), then the tests of the three Windows crates run: the wire format, the client's impersonation level,
+      # the host against a real server and engine (two connections, the rate limit), and the R2 behaviour tests of the DLL and the host.
+      # COM, TSF and the apps are covered by the VM run of docs/spec/windows-tip.md §5.11, not here. The timing builds come first, so the
+      # binaries checked below are the builds without timing.
+      - name: shanjie-tip and shanjie-host builds (release, with and without timing)
         run: |
           set -euo pipefail
-          cargo build --release --locked -p shanjie-tip
           cargo build --release --locked -p shanjie-tip --features timing
+          cargo build --release --locked -p shanjie-host --features timing
+          cargo build --release --locked -p shanjie-tip
+          cargo build --release --locked -p shanjie-host
 
-      - name: shanjie-tip tests (release)
-        run: cargo test --release --locked -p shanjie-tip
+      # docs/spec/windows-tip.md §5.10: neither binary imports a C runtime DLL (static CRT, §3.1); the DLL imports d2d1.dll and dwrite.dll; the DLL exports no
+      # `shanjie_` symbol and `cargo tree` shows no `core` under it (the core would be linked statically, so the import table could not
+      # show it). The DLL's size is printed.
+      - name: shanjie-tip and shanjie-host binaries
+        run: |
+          set -euo pipefail
+          found="$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe')"
+          first="${found%%$'\n'*}"
+          first="${first%$'\r'}"
+          test -n "$first"
+          dumpbin="$(cygpath -u "$first")"
+          for f in target/release/shanjie_tip.dll target/release/shanjie-host.exe; do
+            "$dumpbin" -nologo -dependents "$f" > deps.txt
+            cat deps.txt
+            grep -qi 'kernel32\.dll' deps.txt || { echo "error: no imports listed for $f" >&2; exit 1; }
+            if grep -iE 'vcruntime|msvcp|ucrtbase|api-ms-win-crt' deps.txt; then
+              echo "error: $f imports a C runtime DLL" >&2
+              exit 1
+            fi
+          done
+          # docs/spec/windows-tip.md §3.15: the candidate window's Direct2D and DirectWrite are plain static imports of the DLL (not delay-loaded, not
+          # LoadLibrary by a bare name: neither DLL is a KnownDLL), so the import table must list them, and a delay-load table must not exist.
+          "$dumpbin" -nologo -dependents target/release/shanjie_tip.dll > deps-tip.txt
+          grep -qi 'd2d1\.dll' deps-tip.txt || { echo "error: shanjie_tip.dll does not import d2d1.dll" >&2; exit 1; }
+          grep -qi 'dwrite\.dll' deps-tip.txt || { echo "error: shanjie_tip.dll does not import dwrite.dll" >&2; exit 1; }
+          "$dumpbin" -nologo -imports target/release/shanjie_tip.dll > imports-tip.txt
+          if grep -qi 'delay load' imports-tip.txt; then
+            echo "error: shanjie_tip.dll has delay-loaded imports" >&2
+            exit 1
+          fi
+          "$dumpbin" -nologo -exports target/release/shanjie_tip.dll > exports-crlf.txt
+          tr -d '\r' < exports-crlf.txt > exports.txt
+          cat exports.txt
+          grep -q DllGetClassObject exports.txt || { echo "error: the export table was not read" >&2; exit 1; }
+          # An export name ends its line; the "Dump of file ...shanjie_tip.dll" header does not match (".dll" follows).
+          if grep -iE '[[:space:]]shanjie_[A-Za-z0-9_]*$' exports.txt; then
+            echo "error: the DLL exports core symbols" >&2
+            exit 1
+          fi
+          cargo tree --locked -p shanjie-tip -e normal > tree.txt
+          cat tree.txt
+          grep -q 'shanjie-win-proto v' tree.txt || { echo "error: cargo tree printed no dependencies" >&2; exit 1; }
+          if grep -E '(^|[[:space:]])core v[0-9]' tree.txt; then
+            echo "error: shanjie-tip depends on the core" >&2
+            exit 1
+          fi
+          ls -l target/release/shanjie_tip.dll target/release/shanjie-host.exe
+
+      - name: Windows client and host tests (release)
+        run: cargo test --release --locked -p shanjie-win-proto -p shanjie-tip -p shanjie-host
+
+  # docs/spec/windows-tip.md §2.9: core/tests/engine_cap.rs on x86_64-pc-windows-msvc in release, beside `windows`. It is a third to a half of
+  # the Windows core test time (no Accelerate on Windows: the small model's rerank runs in plain Rust for every key of 70-128 syllables), and it
+  # has none of the per-key p95 tests. Skipped exactly when `core` is.
+  windows-cap:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # The pinned toolchain of the core job (why: its comment).
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: 1.97.1
+
+      # The one copy of the model download and hash check (see the `windows` job).
+      - name: Fetch the language model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fetch-models.sh
+
+      - name: Tests (release, core/tests/engine_cap.rs)
+        run: cargo test -p core --release --locked --test engine_cap
+
+  # docs/spec/windows-tip.md §2.9: the six Windows rowstats equal the Linux job's byte for byte. Its own job so that `windows` need not
+  # wait for `debug`. It runs whenever both succeed (the implicit success() of `if`); when either fails it is skipped and the run fails anyway.
+  rowstats:
+    needs: [changes, debug, windows]
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rowstats-linux
+          path: rowstats-linux
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rowstats-windows
+          path: rowstats-windows
+
+      - name: Rowstats equal the Linux job's
+        shell: bash
+        run: |
+          set -euo pipefail
+          n=0
+          for f in rowstats-linux/*.rowstats; do
+            cmp "$f" "rowstats-windows/$(basename "$f")"
+            echo "equal: $(basename "$f")"
+            n=$((n + 1))
+          done
+          [ "$n" -eq 6 ] || { echo "error: $n Linux rowstats files, not 6" >&2; exit 1; }
+          [ "$(ls rowstats-windows | wc -l)" -eq 6 ] || { echo "error: not 6 Windows rowstats files" >&2; exit 1; }
 
   # docs/spec/release-and-ci.md: the Python steps, which used to follow the release tests in `core`, on Linux. They are development
   # tools; their goldens (the dev302 rowstats among them) match byte for byte on Linux. A golden that only matches on macOS
@@ -346,7 +469,7 @@ jobs:
       - name: IT pack builder (Python)
         run: python3 -W ignore -m unittest tools.test_build_it_pack tools.test_it_sources tools.test_it_wiki_counts
 
-      # The meme pack builder (a build tool; the pack is not shipped) against fixtures and a fake decoder (thresholds, dedupe, the
+      # docs/spec/lexicon-and-packs.md §9.2: the meme pack builder against fixtures and a fake decoder (thresholds, dedupe, the
       # first-place rule, count-file provenance, determinism). No network, no evaluation CLI.
       - name: Meme pack builder (Python)
         run: python3 -W ignore -m unittest tools.test_build_meme_pack
@@ -355,6 +478,12 @@ jobs:
       # No network, no evaluation CLI.
       - name: Beauty pack builder (Python)
         run: python3 -W ignore -m unittest tools.test_build_beauty_pack
+
+      # docs/spec/lexicon-and-packs.md (meme pack): the embedded-sentence generator, and its committed output re-generated and compared.
+      - name: Meme embedded sentences (Python)
+        run: |
+          python3 -W ignore -m unittest tools.test_gen_meme_embedded
+          python3 tools/gen_meme_embedded.py --check eval/dev/meme/words-all.txt eval/dev/meme/embedded.txt
 
       # docs/spec/lexicon-and-packs.md §3.2, §3.7: the common proper-noun builder against fixtures and a fake API, and the
       # committed names-add.tsv sharing no word with the base, overlay-add, sandhi-add and acg-add.

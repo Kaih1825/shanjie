@@ -86,7 +86,8 @@ const DAY: i64 = 20_000;
 const L: Layout = Layout::Standard;
 
 /// The capped lexicon over the lexicon text `text` with the reading term (docs/spec/decoder.md §5), as `Engine::load_lm` gives the App's: the table
-/// is built from the same text (its rows are the ones the mc estimate counts) and no exemption. `set_reading_decode(false)` or `set_reading_active(false)`
+/// is built from the same text (its rows are the ones the mc estimate counts), with no exemption and without the mass step (`with_mass`), which these
+/// small lexicons never meet. `set_reading_decode(false)` or `set_reading_active(false)`
 /// switches it off.
 fn capped_over(text: &str) -> CappedLexicon {
     let lex = Arc::new(Lexicon::parse(text).unwrap());
@@ -572,6 +573,37 @@ fn learned_word_beyond_per_key_is_enumerated() {
     e.learning_clear().unwrap_err(); // no store: an error (docs/spec/learning.md §9.2), memory still dropped
     e.set_left_context(TAUGHT_AFTER);
     assert_ne!(type_syls(&mut e, reading).preedit, word, "and only because of the record");
+}
+
+/// Key scheme 1, rule 16u (docs/spec/keys-and-composition.md §4.1.1): Up swaps are picks of one character; two presses and Enter teach the character the run
+/// stopped on (the second press re-picks the span and keeps the first press's `pre`), not the one between.
+#[test]
+fn up_swaps_teach_the_last_character_only() {
+    let s = shared();
+    let reading = "ㄧˋ";
+    let mut e = engine();
+    assert!(e.set_key_scheme(1).unwrap().is_some());
+    e.set_left_context(TAUGHT_AFTER);
+    let shown = type_syls(&mut e, reading).preedit;
+    let mut base = vec![shown.clone()];
+    for (w, _) in s.lex.entries(&syls(reading)) {
+        if !base.iter().any(|x| x == w) {
+            base.push(w.to_string());
+        }
+    }
+    assert!(base.len() > 3 && !base[1..].contains(&shown));
+    assert_eq!(e.key(k(KeyKind::Up)).unwrap().preedit, base[2]);
+    assert_eq!(e.key(k(KeyKind::Up)).unwrap().preedit, base[1]);
+    assert_eq!(e.key(k(KeyKind::Enter)).unwrap().commit, base[1]);
+    e.set_left_context(TAUGHT_AFTER);
+    assert_eq!(type_syls(&mut e, reading).preedit, base[1], "the last character is taught");
+    e.key(k(KeyKind::Esc)).unwrap();
+    // Without the teach the decoder shows `shown` again (the record is what moved it).
+    let mut fresh = engine();
+    assert!(fresh.set_key_scheme(1).unwrap().is_some());
+    fresh.set_left_context(TAUGHT_AFTER);
+    assert_eq!(type_syls(&mut fresh, reading).preedit, shown);
+    assert!(e.learner().records().iter().all(|r| r.word != base[2]), "the character between is not taught");
 }
 
 // ---------- 6: empty learner changes nothing ----------
@@ -1977,7 +2009,7 @@ fn global_eps_table() {
     // docs/spec/learning.md §6.2, §13.1: with the class term no value above 0 has 0 pollution, so the level is off; the table
     // still prints the learn rate and pollution of each value for the next study of the global level.
     for r in &res {
-        // PLAN A2: of the learnable mirror cases (the model does not already produce the taught sentence) at least 80% are learned.
+        // docs/spec/learning.md §13.1 (learn rate): of the learnable mirror cases (the model does not already produce the taught sentence) at least 80% are learned.
         // The learnable count depends on the model (9/10 with model-v1, 8/9 once 戰機/戰績 became right on its own), so the
         // floor is on the count of learnable cases, which keeps the rate from passing vacuously.
         assert!(r.3 >= 8, "fewer than 8 learnable mirror cases ({} at eps {}): the rate below would not mean anything", r.3, r.0);

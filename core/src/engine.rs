@@ -10,6 +10,7 @@ use crate::lm::{decode_segment_fuzzy, history, rerank_pool, fuzzy_path, CappedLe
 use crate::trigram::TriMemo;
 use crate::digits::DigitTable;
 use crate::english_next::EnglishTable;
+use crate::mixed::MixedTable;
 mod digit_layer;
 use digit_layer::{DRun, DigitAlt, DigitCache, DigitEvent};
 use crate::tinylm::{Learning, RerankLevel, TinyLm, TOPK};
@@ -610,6 +611,19 @@ struct Pred {
     weight: f64,
 }
 
+/// docs/spec/keys-and-composition.md §4.1.1 rule 16u: what the first Up press of a run fixed. The run goes on only while the syllables and the cursor are
+/// as the last press left them and the character before the cursor is the one it put there; anything else starts a new run.
+struct UpRun {
+    syls: Vec<String>,
+    cursor: usize,
+    /// The character shown at the first press, then the single characters of the syllable in §6.1 order.
+    base: Vec<String>,
+    /// The positions in `base` the next presses take (2, then 1, those that exist); empty: the next press opens the window.
+    steps: Vec<usize>,
+    /// The character the last press put before the cursor.
+    shown: String,
+}
+
 struct Cands {
     /// (word, length in syllables)
     list: Vec<(String, usize)>,
@@ -622,6 +636,9 @@ struct Cands {
     /// never expands; `first` is the list position of its first visible row.
     vertical: bool,
     first: usize,
+    /// docs/spec/keys-and-composition.md §4.3: the window opened under key scheme 1 (`set_key_scheme`), fixed when it opened like `vertical`. A vertical one then
+    /// moves by whole pages (`candidate_key_ms`), so `first` is always a multiple of `PAGE_SIZE`.
+    ms: bool,
     /// docs/spec/english-mixed.md §6: the last two items are the lower and upper case of a short word (`ENGLISH_SHORT`) the syllable at
     /// this position was typed as; choosing one swaps that one syllable for an English token. Judged by the item's index, never by
     /// a length field.
@@ -632,6 +649,10 @@ struct Cands {
     /// docs/spec/english-mixed.md §3.3, §5.2: the window of an English token that a revert made (docs/spec/english-mixed.md §3.2); its last item is the
     /// Chinese syllable the keys typed, and this is that syllable's reading (the token's reading is replaced by it when it is chosen).
     zh: Option<String>,
+    /// docs/spec/english-mixed.md §5.7: the list's mixed-word item, its first, as it stands in `list` (the writing, and the English
+    /// token plus its syllables as the length). No lexicon item has that length (the candidate range stops at the token), so the
+    /// pair names the item; a window that has it carries no prediction row items.
+    mixed: Option<(String, usize)>,
     /// docs/spec/prediction.md §5: the prediction row's items the window opened with. They are the first `rows.len()`
     /// entries of `list` (the length field of a list entry cannot mark them). Choosing one whose
     /// reading is longer than or differs from the typed syllables is choosing it from the row; one over exactly those
@@ -643,8 +664,8 @@ struct Cands {
 }
 
 impl Cands {
-    fn new(list: Vec<(String, usize)>, vertical: bool) -> Cands {
-        Cands { list, sel: 0, expanded: false, top: 0, vertical, first: 0, short: None, alt: HashMap::new(), zh: None, rows: Vec::new(), dalt: None }
+    fn new(list: Vec<(String, usize)>, vertical: bool, ms: bool) -> Cands {
+        Cands { list, sel: 0, expanded: false, top: 0, vertical, first: 0, ms, short: None, alt: HashMap::new(), zh: None, mixed: None, rows: Vec::new(), dalt: None }
     }
 
     fn scroll(&mut self) {
@@ -662,6 +683,9 @@ impl Cands {
         self.first = self.first.min(self.sel).min(self.list.len().saturating_sub(PAGE_SIZE));
         if self.sel >= self.first + PAGE_SIZE {
             self.first = self.sel + 1 - PAGE_SIZE;
+        }
+        if self.ms && self.vertical {
+            self.first = self.sel / PAGE_SIZE * PAGE_SIZE; // whole pages (§4.3)
         }
         self.top = self.top.min((self.list.len() - 1) / PAGE_SIZE);
         if self.expanded {
@@ -732,6 +756,11 @@ pub struct Engine {
     predict_on: bool,
     /// Orientation the next candidate window opens with (default horizontal; `set_candidate_vertical`).
     cand_vertical: bool,
+    /// Key scheme (`set_key_scheme`): 0 the rules of docs/spec/keys-and-composition.md §4.1 (default), 1 the `m` rows. A candidate window keeps the one it opened with (`Cands::ms`).
+    key_scheme: u8,
+    /// docs/spec/keys-and-composition.md §4.1.1 rule 16u: the run of Up presses in a composition under key scheme 1, set by each swap. Every key past rule 1 and
+    /// 5q that is not Up clears it, and so does the third press (it opens the window); a call that is not a key is caught by `UpRun`'s check.
+    up_run: Option<UpRun>,
     /// Whether a symbol in an occupied column opens a new unfinished unit (default off; `set_abbreviation`, docs/spec/prediction.md §6).
     abbr: bool,
     /// Test hook: false queries `PREDICT_SCAN` at every start once the learner has records (no gate).
@@ -855,6 +884,11 @@ pub struct Engine {
     /// docs/spec/english-mixed.md §4.1: the English run being typed (Shift+letter starts it): letters shown at the cursor, not yet a
     /// unit. Empty = no run. Never together with an unfinished syllable or a window.
     run: String,
+    /// docs/spec/english-mixed.md §4.4, §5.3: the run keeps its text as typed whatever ends it. Set for a run typed in the ASCII state
+    /// (`set_ascii(1)`; `set_ascii(0)` switches the state off before it ends the run, so the mark is on the run) and for a run
+    /// Backspace reopened from a token whose text the table did not write (the user picked it, or typed it in the ASCII state).
+    /// False whenever there is no run.
+    run_ascii: bool,
     /// docs/spec/english-mixed.md §4.4, §5.3: a token reopened as the run, with the Chinese item it had; it comes back when the run ends with
     /// the same letters.
     run_zh: Option<(String, String, String)>,
@@ -862,6 +896,8 @@ pub struct Engine {
     /// of digit-alphabet keys being typed, the keys of the syllable that just closed (docs/spec/english-mixed.md §7.7; `ld_now` is what the current key saw), and
     /// the counters and trace of the simulator and the golden test. All idle unless `digits_active`.
     digit_table: Option<Arc<DigitTable>>,
+    /// docs/spec/english-mixed.md §5.7: the mixed words (`mixed-words.tsv`, optional). `None`: no item is ever added.
+    mixed: Option<Arc<MixedTable>>,
     digit_cache: Option<Arc<DigitCache>>,
     /// English before Chinese (docs/spec/english-mixed.md §8): the count table (`english-next.tsv`, optional) and the best entry of every
     /// word it names, built once per (lexicon, model). Only the prediction row reads them.
@@ -894,19 +930,20 @@ pub fn load_lexicon(data_dir: &Path) -> Result<Arc<Lexicon>, EngineError> {
 }
 
 /// Pack bits of `Engine::new_with_packs` and `shanjie_engine_new_packs` (docs/spec/lexicon-and-packs.md §4.1, §4.2; `PACK_QUOTES`:
-/// docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2; `PACK_IT`: docs/spec/lexicon-and-packs.md §4.1; `PACK_BEAUTY`: docs/spec/lexicon-and-packs.md §8;
-/// bit 3 (value 8) is kept for the meme pack).
+/// docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2; `PACK_IT`: docs/spec/lexicon-and-packs.md §4.1; `PACK_MEME`: docs/spec/lexicon-and-packs.md §9;
+/// `PACK_BEAUTY`: docs/spec/lexicon-and-packs.md §8).
 pub const PACK_ACG: u32 = 1;
 pub const PACK_QUOTES: u32 = 2;
 pub const PACK_IT: u32 = 4;
+pub const PACK_MEME: u32 = 8;
 pub const PACK_BEAUTY: u32 = 16;
-pub const PACK_ALL: u32 = PACK_ACG | PACK_QUOTES | PACK_IT | PACK_BEAUTY;
+pub const PACK_ALL: u32 = PACK_ACG | PACK_QUOTES | PACK_IT | PACK_MEME | PACK_BEAUTY;
 /// The packs whose rows `CappedLexicon::with_packs` reads (docs/spec/decoder.md §2.5): rows tagged `lm::PACK_OOV_TAG` are
 /// unknown to the model, scored by the pack alone, not capped; the other rows are capped as overlay words, except that a word the model
-/// never saw keeps its pack score. Only the anime pack for now; the quotes pack, the IT pack, the beauty pack and a pack added later are capped like any overlay.
+/// never saw keeps its pack score. Only the anime pack for now; the quotes pack, the IT pack, the meme pack, the beauty pack and a pack added later are capped like any overlay.
 pub const PACK_OOV: u32 = PACK_ACG;
 /// A pack's overlay file inside the packs directory, in the order the packs are appended.
-pub const PACK_FILES: [(u32, &str); 4] = [(PACK_ACG, "acg-add.tsv"), (PACK_QUOTES, "quotes-add.tsv"), (PACK_IT, "it-add.tsv"), (PACK_BEAUTY, "beauty-add.tsv")];
+pub const PACK_FILES: [(u32, &str); 5] = [(PACK_ACG, "acg-add.tsv"), (PACK_QUOTES, "quotes-add.tsv"), (PACK_IT, "it-add.tsv"), (PACK_MEME, "meme-add.tsv"), (PACK_BEAUTY, "beauty-add.tsv")];
 
 /// Why a lexicon load failed, for messages: the file that could not be read and its `ErrorKind`, or the lexicon text
 /// that did not parse (`path` is the data directory the files came from, `detail` the `Lexicon` parse error). The C ABI
@@ -1012,8 +1049,15 @@ fn load_lexicon_split(data_dir: &Path, packs: Option<(&Path, u32)>, extra_file: 
     // Required like the other data files (docs/spec/decoder.md §2.3): missing, malformed, or naming a spelling the lexicon lacks is a load failure.
     let variants = VariantOrder::parse(&read_file(data_dir.join(VARIANT_ORDER_FILE))?).map_err(|e| LoadError::Parse { path: data_dir.join(VARIANT_ORDER_FILE), detail: e.to_string() })?;
     let lex = Lexicon::parse_with_variants(&base, Some(&text), Some(&variants)).map_err(|e| LoadError::Parse { path: data_dir.to_path_buf(), detail: e.to_string() })?;
+    // Required too (docs/spec/lexicon-and-packs.md §2.12): the rerank-protect words join the manual mask; missing or malformed is a load failure.
+    let protect = read_file(data_dir.join(RERANK_PROTECT_FILE))?;
+    let lex = lex.with_protected(&protect).map_err(|detail| LoadError::Parse { path: data_dir.join(RERANK_PROTECT_FILE), detail })?;
     Ok((Arc::new(lex), extra, oov_len))
 }
+
+/// The rerank-protect list in the data directory (docs/spec/lexicon-and-packs.md §2.12): words the rerank may not take out of the n-gram's
+/// first choice, with no score change.
+pub const RERANK_PROTECT_FILE: &str = "rerank-protect.tsv";
 
 /// The text `CappedLexicon::with_packs` takes as its overlay: `overlay-add.tsv` and `names-add.tsv` (read here, as `load_lm` always
 /// did for the first), then the packs' rows `load_lexicon_packs` returned (no sandhi rows). Its words are capped at their corpus
@@ -1037,9 +1081,10 @@ pub const READING_EXEMPT_FILE: &str = "std-exempt.tsv";
 pub fn load_reading_decode(lex: &Lexicon, data_dir: &Path) -> Result<crate::reading::ReadingDecode, LoadError> {
     let base = read_file(data_dir.join("mcbpmf-data.txt"))?;
     let exempt = read_file(data_dir.join(READING_EXEMPT_FILE))?;
-    crate::reading::ReadingDecode::new(lex, &base)
+    let rd = crate::reading::ReadingDecode::new(lex, &base)
         .with_exempt(&exempt)
-        .map_err(|detail| LoadError::Parse { path: data_dir.join(READING_EXEMPT_FILE), detail })
+        .map_err(|detail| LoadError::Parse { path: data_dir.join(READING_EXEMPT_FILE), detail })?;
+    Ok(rd.with_mass(lex, &base))
 }
 
 /// The overlay text the lexicon is parsed with: `overlay-add.tsv` then `sandhi-add.tsv`, with a line
@@ -1081,6 +1126,10 @@ impl Engine {
         e.data_dir = Some(data_dir.to_path_buf());
         // Optional (docs/spec/english-mixed.md §7.2, §7.8): a missing or malformed table leaves the digit feature off and says nothing.
         e.digit_table = std::fs::read_to_string(data_dir.join("digits.tsv")).ok().and_then(|t| DigitTable::parse(&t)).map(Arc::new);
+        // Optional (docs/spec/english-mixed.md §5.7): a missing table, or one with a row that breaks a rule, loads nothing and says nothing.
+        if let Ok(t) = std::fs::read_to_string(data_dir.join("mixed-words.tsv")) {
+            e.set_mixed_words(&t);
+        }
         // Optional (docs/spec/english-mixed.md §8): absent leaves the feature off; a file that is there and does not parse is a load failure (a shipping error
         // must not switch the feature off unseen).
         match std::fs::read_to_string(data_dir.join("english-next.tsv")) {
@@ -1115,6 +1164,8 @@ impl Engine {
             pred_sel: None,
             predict_on: true,
             cand_vertical: false,
+            key_scheme: 0,
+            up_run: None,
             abbr: false,
             scan_gate: true,
             pred_dirty: false,
@@ -1163,8 +1214,10 @@ impl Engine {
             depth: 0,
             fuzzy: 0,
             run: String::new(),
+            run_ascii: false,
             run_zh: None,
             digit_table: None,
+            mixed: None,
             digit_cache: None,
             en_table: None,
             en_words: None,
@@ -1282,7 +1335,7 @@ impl Engine {
         }
     }
 
-    /// The summary tag of the reading table the decoder uses now (`+rd+rx:<sha8>`; empty without a model or with `set_reading_decode(false)`): what
+    /// The summary tag of the reading table the decoder uses now (`+rd+rx:<sha8>+rm`; empty without a model or with `set_reading_decode(false)`): what
     /// `shanjie-replay` prints, so the tag names the table the engine really loaded.
     pub fn reading_tag(&self) -> String {
         self.lm.as_ref().and_then(|st| st.capped.reading_tag()).unwrap_or_default()
@@ -1827,6 +1880,21 @@ impl Engine {
         self.fixed.iter().find(|f| f.start == i).map_or(1, |f| f.word.chars().count())
     }
 
+    /// docs/spec/english-mixed.md §5.7: takes `text` as the mixed-words table. A table with any row that breaks a rule is not loaded
+    /// and the table before it goes too (the engine is as it is without one). `Engine::new` calls this with `mixed-words.tsv`;
+    /// tests call it on `with_lexicon` engines.
+    pub fn set_mixed_words(&mut self, text: &str) -> bool {
+        self.mixed = MixedTable::parse(text, &self.lex).map(Arc::new);
+        self.mixed.is_some()
+    }
+    pub fn mixed_words_loaded(&self) -> bool {
+        self.mixed.is_some()
+    }
+    /// Every row of the loaded table as (English part, reading, writing): what the check set's test types.
+    pub fn mixed_words(&self) -> Vec<(String, Vec<String>, String)> {
+        self.mixed.iter().flat_map(|t| t.rows()).map(|(e, r, w)| (e.to_string(), r.to_vec(), w.to_string())).collect()
+    }
+
     /// Test-purpose injection for `with_lexicon` engines: a prebuilt model and its capped lexicon
     /// (built by `CappedLexicon::new` from this engine's lexicon).
     pub fn set_lm(&mut self, lm: Arc<Lm>, capped: Arc<CappedLexicon>) {
@@ -1871,6 +1939,17 @@ impl Engine {
         self.setting_changed();
         self.cand_vertical = on;
         self.handled()
+    }
+
+    /// The key scheme (docs/spec/keys-and-composition.md §4.1, the `m` rows; default 0): 0 the rules as they are, 1 the Microsoft Zhuyin habits of the Windows text service. Any other value changes nothing
+    /// and gives `Ok(None)` (the C ABI's 2). A candidate window already open keeps the scheme it opened with; with a window open or nothing shown the snapshot equals the output before the call.
+    pub fn set_key_scheme(&mut self, scheme: u32) -> Result<Option<Output>, EngineError> {
+        if scheme > 1 {
+            return Ok(None);
+        }
+        self.setting_changed();
+        self.key_scheme = scheme as u8;
+        self.handled().map(Some)
     }
 
     /// Whether a symbol typed into an occupied column opens a new unfinished unit (default off, docs/spec/prediction.md §6).
@@ -1972,6 +2051,7 @@ impl Engine {
             let keep = self.shadow_text();
             self.clear_pend();
             self.run = keep;
+            self.run_ascii = true;
             self.run_zh = None;
             self.revert_point = None;
             if self.cursor < self.syls.len() {
@@ -2053,6 +2133,7 @@ impl Engine {
         }
     }
 
+    // (`english_writing` is a free function below the impl: the CLI asks it too.)
     /// The writings of an English word, in the order of the window (docs/spec/english-mixed.md §4.4, §5.2): as it stands, then lower case,
     /// Capitalised, UPPER (no repeat).
     fn english_writings(word: &str) -> Vec<String> {
@@ -2068,12 +2149,6 @@ impl Engine {
         list
     }
 
-    /// Letters become an English token at the cursor (reading `PUNCT_PREFIX` + the word, the word as its fixed word). Returns what the
-    /// unit that reaches `MAX_SYLLABLES` sent, if it did (docs/spec/english-mixed.md §4.1: it goes in this key's output).
-    fn insert_english(&mut self, word: String) -> Result<String, EngineError> {
-        self.put_english(format!("{PUNCT_PREFIX}{word}"), word, None)
-    }
-
     /// The one place an English token goes in at the cursor: the unfinished syllable and the shadow go. `zh`: the Chinese syllable a
     /// revert remembers (docs/spec/english-mixed.md §3.2), the last item of the token's writings.
     fn put_english(&mut self, reading: String, word: String, zh: Option<String>) -> Result<String, EngineError> {
@@ -2085,12 +2160,16 @@ impl Engine {
     /// docs/spec/english-mixed.md §5.3: the English token at `at` goes and an English run opens there, holding its text without the last letter (a
     /// one-letter token just goes). The run opens before the removal, so the decode splits at it (docs/spec/english-mixed.md §4.7).
     fn reopen_token(&mut self, at: usize) -> Result<(), EngineError> {
-        let mut letters = match self.fixed.iter().find(|f| f.start == at) {
-            Some(f) => f.word.clone(),
-            None => english_of(&self.syls[at]).unwrap_or_default().to_string(),
-        };
+        let typed = english_of(&self.syls[at]).unwrap_or_default();
+        let word = self.fixed.iter().find(|f| f.start == at).map_or(typed, |f| f.word.as_str());
+        // docs/spec/english-mixed.md §5.3: a writing the table put there goes back to what was typed, so taking a letter and typing
+        // it again ends as the first time did (`ChatGPT` reopens as `Chatgp`, never `ChatGP`). Any other text is one the user chose
+        // (picked from the list, or typed in the ASCII state): it reopens as it stands and the table leaves it alone when it ends.
+        let by_table = word == english_writing(typed);
+        let mut letters = if by_table { typed.to_string() } else { word.to_string() };
         letters.pop();
         self.run = letters;
+        self.run_ascii = (self.ascii || !by_table) && !self.run.is_empty();
         self.run_zh = None;
         self.revert_point = None;
         self.cursor = at;
@@ -2178,10 +2257,12 @@ impl Engine {
         }
         let head: String = chars[..chars.len() - tail.len()].iter().collect();
         self.run.clear();
+        // docs/spec/english-mixed.md §4.4, §5.3: the head is a token in its writing, as typed when the run keeps its text (`end_run`).
+        let writing = if std::mem::take(&mut self.run_ascii) { head.clone() } else { english_writing(&head) };
         self.run_zh = None;
         self.revert_point = None;
         self.split = true;
-        let mut commit = if head.is_empty() { String::new() } else { self.insert_english(head)? };
+        let mut commit = if head.is_empty() { String::new() } else { self.put_english(format!("{PUNCT_PREFIX}{head}"), writing, None)? };
         self.pred_dirty = true;
         commit.push_str(&self.insert_token(syl, None, None)?.commit);
         Ok(self.view(true, commit))
@@ -2193,17 +2274,20 @@ impl Engine {
     /// that reaches `MAX_SYLLABLES` sent, if it did. A run a revert opened and nobody changed keeps its Chinese item (docs/spec/english-mixed.md §3.2).
     fn end_run(&mut self) -> Result<String, EngineError> {
         let word = std::mem::take(&mut self.run);
+        // docs/spec/english-mixed.md §4.4: the token shows the word's writing; a run typed in the ASCII state stays as typed.
+        let writing = if std::mem::take(&mut self.run_ascii) { word.clone() } else { english_writing(&word) };
         self.revert_point = None;
         if let Some((_, zh, reading)) = self.run_zh.take().filter(|(w, _, _)| *w == word) {
-            return self.put_english(reading, word, Some(zh));
+            return self.put_english(reading, writing, Some(zh));
         }
-        self.insert_english(word)
+        self.put_english(format!("{PUNCT_PREFIX}{word}"), writing, None)
     }
 
     /// A character on the run; the 33rd ends it and starts the next one. Returns what ending sent, if it sent anything.
     fn run_push(&mut self, c: char) -> Result<String, EngineError> {
         let commit = if self.run.len() == ENGLISH_RUN_MAX { self.end_run()? } else { String::new() };
         self.run.push(c);
+        self.run_ascii |= self.ascii;
         self.run_zh = None; // the run was changed: no Chinese item, no Esc back to the Zhuyin
         self.revert_point = None;
         Ok(commit)
@@ -2260,6 +2344,7 @@ impl Engine {
         match k.kind {
             KeyKind::Backspace => {
                 self.run.pop();
+                self.run_ascii &= !self.run.is_empty();
                 self.run_zh = None;
                 self.revert_point = None;
                 self.pred_dirty = true;
@@ -2268,6 +2353,7 @@ impl Engine {
             }
             KeyKind::Esc => {
                 self.run.clear();
+                self.run_ascii = false;
                 self.run_zh = None;
                 if let Some((pend, shadow)) = self.revert_point.take() {
                     (self.pend, self.shadow_key) = (pend, shadow); // docs/spec/english-mixed.md §4.2: back to the Zhuyin the key would have made
@@ -2458,6 +2544,10 @@ impl Engine {
     pub fn reset(&mut self, mode: ResetMode) -> Output {
         // docs/spec/english-mixed.md §7.4: the buffered digits are tokens before the composition is sent (Commit); Discard drops them with the rest.
         let digits = if mode == ResetMode::Commit { self.digit_flush().unwrap_or_default().0 } else { String::new() };
+        if mode == ResetMode::Commit && !self.run.is_empty() && !self.run_ascii {
+            // docs/spec/english-mixed.md §4.4: an open run goes out in its writing, the text Enter would send (Enter ends the run first).
+            self.run = english_writing(&self.run);
+        }
         let commit = if mode == ResetMode::Commit { digits + &self.shown().0 } else { String::new() };
         self.clear_all();
         self.view(true, commit)
@@ -2861,6 +2951,7 @@ impl Engine {
         self.path.clear();
         self.cands = None;
         self.run.clear();
+        self.run_ascii = false;
         self.run_zh = None;
         self.revert_point = None;
         self.last_short = None;
@@ -3231,6 +3322,9 @@ impl Engine {
     fn dispatch_key(&mut self, k: Key) -> Result<Output, EngineError> {
         let m = k.modifiers;
         let is_char = k.kind == KeyKind::Char;
+        // The key scheme in force for this key (docs/spec/keys-and-composition.md §4.1.1): the scheme the open window opened with, else the current setting. Read once, here:
+        // a window that closes under rule 8 and lets the key go on does not change it, and a setting changed with a window open does not reach the rows until it closes.
+        let ms = self.cands.as_ref().map_or(self.key_scheme == 1, |c| c.ms);
         // docs/spec/macos-shell.md §8.6.2: Page Up / Down mean something only in an open vertical window, without
         // modifiers; anywhere else the key changes nothing (not even the prediction row) and is not handled.
         if matches!(k.kind, KeyKind::PageUp | KeyKind::PageDown) && !(m == 0 && self.cands.as_ref().is_some_and(|c| c.vertical)) {
@@ -3258,9 +3352,20 @@ impl Engine {
             return self.handled();
         }
         let ctrl_bs = is_char && k.ch == '\\' && m == MOD_CONTROL;
+        // Key scheme 1, K11 (docs/spec/keys-and-composition.md §4.1, step 3): Ctrl+, and Ctrl+. put a full-width mark into the composition, an exception to rule 1 like Ctrl+\
+        // (any unfinished syllable goes, an open window closes). Not with an English run or digit buffer open, nor in the ASCII state: those pass on as rule 1 says.
+        if ms && is_char && m == MOD_CONTROL && (k.ch == ',' || k.ch == '.') && self.run.is_empty() && self.drun.is_none() && !self.ascii {
+            self.clear_pred();
+            return self.insert_punct(if k.ch == ',' { '，' } else { '。' });
+        }
         // 1: pass through, no state change.
         if m & (MOD_OPTION | MOD_COMMAND | MOD_CAPSLOCK) != 0 || (m & MOD_CONTROL != 0 && !ctrl_bs) {
             return self.passthrough(String::new());
+        }
+        // Rule 16u: any other key that gets past rules 1 and 5q ends a run of Up presses (the ones above that change the composition, ⌘⌫ and Ctrl+, Ctrl+.,
+        // fail `UpRun`'s check instead).
+        if k.kind != KeyKind::Up {
+            self.up_run = None;
         }
         // docs/spec/keys-and-composition.md §9.3: in the ASCII state, with a shadow, a printable ASCII character
         // closes an open window or row without choosing (so `1` is a character, never a pick) and then either goes on the English run as
@@ -3282,6 +3387,7 @@ impl Engine {
             let opened = self.run.is_empty();
             if opened {
                 self.run = self.shadow_text();
+                self.run_ascii = !self.run.is_empty();
                 self.clear_pend();
             }
             if !(k.ch.is_ascii_alphanumeric() || ",.;/-".contains(k.ch)) {
@@ -3340,6 +3446,31 @@ impl Engine {
         if !self.run.is_empty() {
             return self.run_key(k);
         }
+        // Key scheme 1, K8-K10 and K24a (step 7, in rule 2's place for these two keys): Shift+, and Shift+. are the half-width `<` `>`. With a window open they
+        // are eaten (K24a). Nothing composed: passed on (K8). Only an unfinished syllable: it goes and the character is committed, never passed on (K9; an IMM32
+        // host drops a key that was claimed and then passed on, docs/spec/windows-tip.md §5.4). Otherwise the character becomes a half-width unit at the cursor
+        // (K10, and K9a after the unfinished syllable went).
+        if ms && is_char && m == MOD_SHIFT && (k.ch == ',' || k.ch == '.') {
+            if self.cands.is_some() {
+                self.mark_noop();
+                return self.handled();
+            }
+            let c = if k.ch == ',' { '<' } else { '>' };
+            if !self.syls.is_empty() {
+                return self.insert_punct(c);
+            }
+            if self.pend.iter().any(Option::is_some) {
+                self.clear_pend();
+                self.left.clear(); // the app's text changes under the cursor, as at a rule 22 pass-through
+                self.left_full.clear();
+                self.left_cut = false;
+                return Ok(self.view(true, c.to_string()));
+            }
+            self.left.clear();
+            self.left_full.clear();
+            self.left_cut = false;
+            return self.passthrough(String::new());
+        }
         // 2: punctuation.
         let punct = if ctrl_bs {
             Some('、')
@@ -3352,11 +3483,25 @@ impl Engine {
         };
         if let Some(p) = punct {
             // docs/spec/keys-and-composition.md §8.2: into the composition at the cursor, not committed. Anything unfinished is dropped.
-            self.clear_pend();
-            self.cands = None;
-            return self.insert_token(format!("{PUNCT_PREFIX}{p}"), Some(p.to_string()), None);
+            return self.insert_punct(p);
         }
         let plain = m == 0;
+        // Key scheme 1, K3, K3a and K7 (before step 8, with no window open; with one, K24 eats the key in `candidate_key_ms`): Shift+letter. Only an unfinished
+        // syllable: it goes and the upper-case letter is committed (K3). Otherwise the letter becomes a half-width unit at the cursor (K3a after the unfinished
+        // syllable went, K7). Nothing composed: the rules below (rule 22, or an English run).
+        if ms && is_char && m == MOD_SHIFT && k.ch.is_ascii_alphabetic() && self.cands.is_none() {
+            let upper = k.ch.to_ascii_uppercase();
+            if !self.syls.is_empty() {
+                return self.insert_punct(upper);
+            }
+            if self.pend.iter().any(Option::is_some) {
+                self.clear_pend();
+                self.left.clear();
+                self.left_full.clear();
+                self.left_cut = false;
+                return Ok(self.view(true, upper.to_string()));
+            }
+        }
         // docs/spec/english-mixed.md §4.1: Shift+letter starts an English run (the letter in upper case, from the keycap and Shift).
         if is_char && m == MOD_SHIFT && k.ch.is_ascii_alphabetic() && self.shadow_on() {
             return self.start_run(k.ch.to_ascii_uppercase());
@@ -3418,6 +3563,8 @@ impl Engine {
                 self.pred_dirty = true;
             } else if k.kind == KeyKind::Esc {
                 self.clear_pend();
+            } else if k.kind == KeyKind::Enter && ms {
+                self.nothing(old); // K1, K2: Enter and Shift+Enter do nothing
             } else if k.kind == KeyKind::Enter {
                 return self.commit_enter(m); // 12a, 12b
             } else if k.kind == KeyKind::Down && self.pend_prev.is_empty() {
@@ -3456,11 +3603,28 @@ impl Engine {
                 self.pred_dirty = true; // docs/spec/english-mixed.md §8: the row behind English reaches the space unit (empty without the table, as before)
                 return self.insert_token(format!("{PUNCT_PREFIX} "), Some(" ".to_string()), None);
             }
+            // Key scheme 1, K5: Space types a half-width space unit; only Down opens the window.
+            KeyKind::Space if ms => return self.insert_punct(' '),
             // In front of one (cursor 0) Space opens nothing: the writings list opens with Down only.
             KeyKind::Space if self.cursor == 0 && self.breaks_with_space(0) => self.nothing(old),
+            // Key scheme 1, rule 15d: Down opens the window with the item shown over its span first.
+            KeyKind::Down if ms => {
+                self.open_candidates(old);
+                self.shown_first();
+            }
             KeyKind::Space | KeyKind::Down => self.open_candidates(old),
+            // Key scheme 1, rule 16u: Up swaps the character before the cursor.
+            KeyKind::Up if ms => return self.up_swap(old),
             KeyKind::Up => self.nothing(old),
-            KeyKind::Char if tone.is_some() => self.nothing(old),
+            KeyKind::Char if tone.is_some() => {
+                // Key scheme 1, K25: a tone key types its mark as a unit, as rule 22a does on an empty composition.
+                if let (1, Some(t)) = (u8::from(ms), tone) {
+                    return self.insert_punct(TONE_MARKS[t].chars().next().unwrap_or(' '));
+                }
+                self.nothing(old)
+            }
+            // Key scheme 1, K6: Tab and Shift+Tab do nothing.
+            KeyKind::Tab if ms => self.nothing(old),
             KeyKind::Right | KeyKind::End if self.cursor == n => self.nothing(old), // nothing moves
             KeyKind::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyKind::Right => self.cursor = (self.cursor + 1).min(n),
@@ -3477,6 +3641,11 @@ impl Engine {
             }
             KeyKind::Delete if self.cursor < n => self.remove_syllable(self.cursor)?,
             KeyKind::Backspace | KeyKind::Delete => self.nothing(old),
+            // Key scheme 1, K19: Shift+Enter sends the composition and the key is handled, so the app gets no line break.
+            KeyKind::Enter if ms => {
+                let commit = self.take_commit();
+                return Ok(self.view(true, commit));
+            }
             KeyKind::Enter => return self.commit_enter(m), // 19, 19a
             KeyKind::Esc => self.clear_all(),
             _ => {
@@ -3490,6 +3659,9 @@ impl Engine {
     /// Rules 3-8 (docs/spec/keys-and-composition.md §4.1, §4.3). `Ok(true)` = consumed; `Ok(false)` = candidates closed, key
     /// continues at rule 9.
     fn candidate_key(&mut self, k: Key) -> Result<bool, EngineError> {
+        if self.cands.as_ref().is_some_and(|c| c.ms && c.vertical) {
+            return self.candidate_key_ms(k);
+        }
         let Some(c) = &mut self.cands else { return Ok(false) };
         let (len, sel, cols) = (c.list.len(), c.sel, PAGE_SIZE);
         let digit = (k.kind == KeyKind::Char && k.modifiers == 0 && ('1'..='9').contains(&k.ch))
@@ -3596,6 +3768,63 @@ impl Engine {
             }
         }
         Ok(true)
+    }
+
+    /// Key scheme 1's rules 3-8 (docs/spec/keys-and-composition.md §4.1, K12-K17 and K21-K24) for a vertical window that opened under it: the visible range is a whole
+    /// page, so `first` stays a multiple of `PAGE_SIZE` and `sel` inside `first..first + PAGE_SIZE`. No key that reaches here closes the window and goes on (rule 8): each is
+    /// consumed, and the ones without a row (Backspace, Tab, Right, Left, Home, Delete, a Zhuyin key, Shift+letter) change nothing. Always `Ok(true)`. The keys of rule 2 (punctuation, Ctrl+\)
+    /// never get here: step 7 closes the window and inserts the mark first, in both schemes.
+    fn candidate_key_ms(&mut self, k: Key) -> Result<bool, EngineError> {
+        let Some(c) = &mut self.cands else { return Ok(false) };
+        let (len, sel, first) = (c.list.len(), c.sel, c.first);
+        let last_first = len.saturating_sub(1) / PAGE_SIZE * PAGE_SIZE;
+        let digit = (k.kind == KeyKind::Char && k.modifiers == 0 && ('1'..='9').contains(&k.ch)).then(|| k.ch as usize - '1' as usize);
+        match (k.kind, digit) {
+            (KeyKind::Char, Some(d)) => {
+                if first + d < len {
+                    self.choose(first + d)?;
+                }
+            }
+            // K16: the next one, across the page; after the last one the first.
+            (KeyKind::Down, _) => {
+                c.sel = if sel + 1 < len { sel + 1 } else { 0 };
+                c.first = c.sel / PAGE_SIZE * PAGE_SIZE;
+            }
+            // K13: the previous one, across the page; before the first one the last.
+            (KeyKind::Up, _) => {
+                c.sel = if sel > 0 { sel - 1 } else { len.saturating_sub(1) };
+                c.first = c.sel / PAGE_SIZE * PAGE_SIZE;
+            }
+            // K14: the next page, its first row selected; after the last page the first.
+            (KeyKind::Space | KeyKind::PageDown, _) => {
+                c.first = if first < last_first { first + PAGE_SIZE } else { 0 };
+                c.sel = c.first;
+            }
+            // K15: the previous page, its first row selected; before the first page the last.
+            (KeyKind::PageUp, _) => {
+                c.first = if first > 0 { first - PAGE_SIZE } else { last_first };
+                c.sel = c.first;
+            }
+            // K22: the last page, its last row selected.
+            (KeyKind::End, _) => {
+                c.sel = len.saturating_sub(1);
+                c.first = last_first;
+            }
+            // K23: Shift+Enter closes the window and chooses nothing.
+            (KeyKind::Enter, _) if k.modifiers & MOD_SHIFT != 0 => self.cands = None,
+            (KeyKind::Enter, _) => self.choose(sel)?,
+            (KeyKind::Esc, _) => self.cands = None,
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// Rule 2's insertion, also the key scheme 1 rows that put a character into the composition: anything unfinished goes, an open window closes, and `p` becomes a
+    /// one-character fixed unit at the cursor (docs/spec/keys-and-composition.md §8.2; a half-width one is what `set_ascii` makes).
+    fn insert_punct(&mut self, p: char) -> Result<Output, EngineError> {
+        self.clear_pend();
+        self.cands = None;
+        self.insert_token(format!("{PUNCT_PREFIX}{p}"), Some(p.to_string()), None)
     }
 
     /// docs/spec/keys-and-composition.md §4.3 mouse pick: `index` is a position in the last output's `candidates`: the candidate window's, or, with
@@ -3861,7 +4090,7 @@ impl Engine {
                 let mut list: Vec<(String, usize)> = Self::english_writings(f.map_or(word, |f| f.word.as_str())).into_iter().map(|w| (w, 1)).collect();
                 let zh = f.and_then(|f| f.zh.clone());
                 let zh = zh.and_then(|syl| self.lex.entries(std::slice::from_ref(&syl)).first().map(|(w, _)| (w.to_string(), syl)));
-                let mut c = Cands::new(Vec::new(), self.cand_vertical);
+                let mut c = Cands::new(Vec::new(), self.cand_vertical, self.key_scheme == 1);
                 if let Some((word, syl)) = zh {
                     list.push((word, 1));
                     c.zh = Some(syl);
@@ -3876,7 +4105,7 @@ impl Engine {
                 let mut list: Vec<(String, usize)> = rows.iter().map(|p| (p.word.clone(), p.reading.len())).collect();
                 list.push((d.to_string(), 1));
                 list.push((digit_layer::full_width(d).to_string(), 1));
-                let mut c = Cands::new(Vec::new(), self.cand_vertical);
+                let mut c = Cands::new(Vec::new(), self.cand_vertical, self.key_scheme == 1);
                 if let Some((n, syl, word)) = self.digit_syllable_alt(touching + 1) {
                     list.push((word, 1));
                     c.dalt = Some(DigitAlt::Syllable { n, syl });
@@ -3894,7 +4123,7 @@ impl Engine {
                     list.push((w, 1));
                 }
             }
-            self.cands = Some(Cands::new(list, self.cand_vertical));
+            self.cands = Some(Cands::new(list, self.cand_vertical, self.key_scheme == 1));
             return;
         }
         self.open_with_rows(rows);
@@ -3912,13 +4141,17 @@ impl Engine {
     /// docs/spec/prediction.md §5: the window's list: the row's items in their order, then (without an unfinished
     /// syllable, which has no lexicon candidates) the lexicon's entries for the syllables before the cursor, longest
     /// first, minus the words already listed.
-    fn window_list(&self, rows: Vec<Pred>) -> (Vec<(String, usize)>, HashMap<usize, Vec<String>>, Vec<Pred>) {
-        let mut rows = rows;
+    fn window_list(&self, rows: Vec<Pred>) -> (Vec<(String, usize)>, HashMap<usize, Vec<String>>, Vec<Pred>, Option<(String, usize)>) {
+        // docs/spec/english-mixed.md §5.7: the mixed word is the first item of the list; the window then carries no row items (they are
+        // told apart by being the first `rows.len()` entries), and no lexicon word has its text.
+        let mixed = self.mixed_item();
+        let mut rows = if mixed.is_some() { Vec::new() } else { rows };
         let mut seen: HashSet<String> = rows.iter().map(|p| p.word.clone()).collect();
         let mut list: Vec<(String, usize)> = rows.iter().map(|p| (p.word.clone(), p.reading.len())).collect();
+        list.extend(mixed.clone());
         if self.pend.iter().any(Option::is_some) {
             self.variant_move(&mut list, &mut rows);
-            return (list, HashMap::new(), rows);
+            return (list, HashMap::new(), rows, None);
         }
         let a = self.cursor;
         let today = if self.learner.has_new_words() { self.today() } else { 0 };
@@ -3952,7 +4185,19 @@ impl Engine {
                 }
             }
         }
-        (list, alt, rows)
+        (list, alt, rows, mixed)
+    }
+
+    /// docs/spec/english-mixed.md §5.7: with the cursor at the end and no unfinished syllable, an English token and then the syllables
+    /// up to the cursor that the table has as one word: that word and its length (the token and the syllables). Only the readings as
+    /// typed are looked up.
+    fn mixed_item(&self) -> Option<(String, usize)> {
+        let (a, k) = (self.cursor, self.avail());
+        if a != self.syls.len() || k == 0 || a <= k || self.pend.iter().any(Option::is_some) {
+            return None;
+        }
+        let english = english_of(&self.syls[a - k - 1])?;
+        self.mixed.as_ref()?.get(english, &self.syls[a - k..a]).map(|w| (w.to_string(), k + 1))
     }
 
     /// Variant order (docs/spec/decoder.md §2.3): under one reading, a less-typed spelling that the window lists before its
@@ -4003,7 +4248,7 @@ impl Engine {
 
     /// Opens the window on `window_list`; an empty list opens nothing (and the row is gone, as before the prediction row).
     fn open_with_rows(&mut self, rows: Vec<Pred>) {
-        let (mut list, alt, rows) = self.window_list(rows);
+        let (mut list, alt, rows, mixed) = self.window_list(rows);
         // docs/spec/english-mixed.md §7.7: right after a syllable the digit keys closed, its digits are the last item.
         let digits = self.ld_now.take().filter(|_| !list.is_empty());
         if let Some(keys) = &digits {
@@ -4017,13 +4262,87 @@ impl Engine {
             list.push((word.to_ascii_uppercase(), 1));
         }
         if !list.is_empty() {
-            let mut c = Cands::new(list, self.cand_vertical);
+            let mut c = Cands::new(list, self.cand_vertical, self.key_scheme == 1);
             c.alt = alt;
             c.rows = rows;
+            c.mixed = mixed;
             c.dalt = digits.map(DigitAlt::Digits);
             c.short = short;
             self.cands = Some(c);
         }
+    }
+
+    /// Key scheme 1, rule 15d (docs/spec/keys-and-composition.md §4.1.1): in the window just opened, the first lexicon item whose text is what the composition shows
+    /// over its span moves to the front of the lexicon items, the others keep their order, and it is selected. The prediction row's items (none on Windows,
+    /// which turns the row off) stay first, and the items tied to the end of the list (a short word's two cases, a digit alternative) and to their positions
+    /// (fuzzy readings) keep working: `alt` is renumbered and the tail is never moved.
+    fn shown_first(&mut self) {
+        let a = self.cursor;
+        let Some(c) = self.cands.as_ref() else { return };
+        let tail = if c.short.is_some() { 2 } else { usize::from(c.dalt.is_some()) };
+        // The mixed word (docs/spec/english-mixed.md §5.7) stays the first item: the shown word goes right after it.
+        let lo = c.rows.len() + usize::from(c.mixed.is_some());
+        let hi = c.list.len().saturating_sub(tail);
+        let found = (lo..hi).find(|&i| {
+            let (w, l) = &c.list[i];
+            let (s, e) = if a == 0 { (0, *l) } else { (a.saturating_sub(*l), a) };
+            e <= self.syls.len() && s < e && self.span_text(s, e) == *w
+        });
+        let Some(j) = found else { return };
+        let Some(c) = self.cands.as_mut() else { return };
+        let item = c.list.remove(j);
+        c.list.insert(lo, item);
+        c.alt = std::mem::take(&mut c.alt).into_iter().map(|(k, r)| (if k == j { lo } else if (lo..j).contains(&k) { k + 1 } else { k }, r)).collect();
+        c.sel = lo;
+        c.first = lo / PAGE_SIZE * PAGE_SIZE;
+    }
+
+    /// Key scheme 1, rule 16u (docs/spec/keys-and-composition.md §4.1.1): Up in a composition (no unfinished syllable, no window). The first press of a run takes
+    /// the character shown before the cursor and the single characters of that syllable (§6.1, lexicon order) and puts the shown one first; the presses
+    /// then choose the third item and the second (as choosing a one-syllable word, `choose`: the rest of the composition freezes, and a re-pick of the
+    /// span keeps the first pick's `pre`, so the commit teaches the last character only), and the press after them opens the window with the shown item first
+    /// (rule 15d). A list of two skips the third item, a list of one opens the window at once. Rule 16 (nothing changes) when the cursor is at 0, the
+    /// syllable before it is punctuation, a space, an English or digit token, its list is empty or the shown character is not in it.
+    fn up_swap(&mut self, old: Vec<Pred>) -> Result<Output, EngineError> {
+        let a = self.cursor;
+        let shown_now = if a > 0 { self.span_text(a - 1, a) } else { String::new() };
+        let run = self.up_run.take().filter(|r| r.syls == self.syls && r.cursor == a && r.shown == shown_now);
+        let mut run = match run {
+            Some(r) => r,
+            None => {
+                if a == 0 || self.is_punct(a - 1) {
+                    self.nothing(old);
+                    return self.handled();
+                }
+                let mut singles: Vec<String> = Vec::new();
+                for (w, _) in self.lex.entries(&self.syls[a - 1..a]) {
+                    if !singles.iter().any(|x| x == w) {
+                        singles.push(w.to_string());
+                    }
+                }
+                if !singles.contains(&shown_now) {
+                    self.nothing(old);
+                    return self.handled();
+                }
+                let mut base = vec![shown_now.clone()];
+                base.extend(singles.into_iter().filter(|w| *w != shown_now));
+                let steps = [2, 1].into_iter().filter(|&i| i < base.len()).collect();
+                UpRun { syls: self.syls.clone(), cursor: a, base, steps, shown: shown_now }
+            }
+        };
+        if run.steps.is_empty() {
+            self.open_candidates(old);
+            self.shown_first();
+            return self.handled();
+        }
+        let i = run.steps.remove(0);
+        self.cands = Some(Cands::new(vec![(run.base[i].clone(), 1)], self.cand_vertical, true));
+        self.choose(0)?;
+        run.syls.clone_from(&self.syls);
+        run.cursor = self.cursor;
+        run.shown = self.span_text(a - 1, a);
+        self.up_run = Some(run);
+        self.chosen()
     }
 
     /// docs/spec/learning.md §4.2: what to remember as the text before this pick, `None` for punctuation. Re-picking the
@@ -4093,7 +4412,7 @@ impl Engine {
             self.recompute_pred();
             c.rows = std::mem::take(&mut self.pred);
             c.rows.retain(|p| p.word != word);
-            (c.list, c.alt, c.rows) = self.window_list(std::mem::take(&mut c.rows));
+            (c.list, c.alt, c.rows, c.mixed) = self.window_list(std::mem::take(&mut c.rows));
             c.list.extend(kept);
             if c.list.is_empty() {
                 return Ok(()); // closed, as by Esc
@@ -4250,6 +4569,21 @@ impl Engine {
             return Ok(());
         }
         let Some((word, l)) = c.list.get(idx).cloned() else { return Ok(()) };
+        // docs/spec/english-mixed.md §5.7: the mixed word takes the place of the English token and its syllables as one token of the
+        // punctuation kind (reading `PUNCT_PREFIX` + the writing, fixed to the writing): not a re-pick, nothing is learned.
+        if idx >= c.rows.len() && c.mixed.as_ref() == Some(&(word.clone(), l)) && l <= self.cursor {
+            let start = self.cursor - l;
+            for i in (start..self.cursor).rev() {
+                self.remove_syllable(i)?;
+            }
+            self.cursor = start;
+            self.pred_dirty = true;
+            let commit = self.insert_token(format!("{PUNCT_PREFIX}{word}"), Some(word), None)?.commit;
+            if !commit.is_empty() {
+                self.commit_out = Some(commit);
+            }
+            return Ok(());
+        }
         let (start, end) = if self.cursor == 0 { (0, l) } else { (self.cursor - l, self.cursor) };
         // New words of the path as shown, under the readings of their records: read before the span is rewritten below (docs/spec/learning.md §8.5, bookkeeping).
         let path_new = if self.learning { self.path_new_words() } else { Vec::new() };
@@ -4315,6 +4649,47 @@ impl Engine {
         self.fixed.push(Fixed { start, end, word, pre, key, pick_keys, zh, frozen: false, split_off: false, displaced_new });
         self.fixed.sort_by_key(|f| f.start);
         self.refresh()
+    }
+}
+
+#[cfg(test)]
+mod up_run_tests {
+    use super::*;
+
+    /// docs/spec/keys-and-composition.md §4.1.1 rule 16u: after a call that is not a key, the next Up goes on with the run only if the syllables, the cursor
+    /// and the character before the cursor are what the last press left. Each case changes one of the three in the stored run (as a call that rewrote the
+    /// composition would, with no key in between to clear it) and presses Up twice: a new run swaps on both presses, a run that went on would open the window
+    /// on the second.
+    #[test]
+    fn a_changed_composition_starts_a_new_run() {
+        let text: String = (0..30).map(|i| format!("ㄋㄧˇ {} -1.0\n", char::from_u32(0x4E00 + i).unwrap())).collect();
+        let lex = Arc::new(Lexicon::parse(&text).unwrap());
+        let l: Vec<String> = lex.entries(&["ㄋㄧˇ".to_string()]).into_iter().map(|(w, _)| w.to_string()).collect();
+        let up = |e: &mut Engine| e.key(Key::new(KeyKind::Up)).unwrap();
+        type Change = fn(&mut UpRun);
+        let changes: [(&str, Change); 4] = [
+            ("nothing", |_| {}),
+            ("syllables", |r| r.syls.push("ㄋㄧˇ".to_string())),
+            ("cursor", |r| r.cursor += 1),
+            ("shown", |r| r.shown = "x".to_string()),
+        ];
+        for (name, change) in changes {
+            let mut e = Engine::with_lexicon(lex.clone(), Layout::Standard);
+            e.set_candidate_vertical(true).unwrap();
+            e.set_key_scheme(1).unwrap();
+            for c in ['s', 'u', '3'] {
+                e.key(Key::ch(c, 0)).unwrap();
+            }
+            assert_eq!(up(&mut e).preedit, l[2], "{name}: the 1st press");
+            change(e.up_run.as_mut().expect("a run after the 1st press"));
+            assert_eq!(up(&mut e).preedit, l[1], "{name}: [l0, l1, l2][1] or [l2, l0, l1][2]");
+            let o = up(&mut e);
+            if name == "nothing" {
+                assert!(o.selected == Some(0) && o.candidates.first() == Some(&l[1]), "nothing changed: the run goes on, the 3rd press opens");
+            } else {
+                assert!(o.selected.is_none() && o.preedit == l[0], "{name}: a new run, its 2nd press swaps to [l2, l0, l1][1]");
+            }
+        }
     }
 }
 
@@ -4442,5 +4817,68 @@ mod sinit_tests {
         assert_eq!(sinit_swap(&mut best, &fuzzy_only, &mut pool, &LEARNED), Swap::Missing, "a learned path with a fuzzy word is not a candidate");
         assert_eq!(pool, (0..8).collect::<Vec<_>>());
         assert_eq!(best.len(), 10);
+    }
+}
+
+/// docs/spec/english-mixed.md §4.4: the table of official writings, lower case -> the line. Two files, both compiled in: products,
+/// brands and abbreviations (`data/english-extra.txt`) and the English writings of the names layer
+/// (`data/lexicon/names-english.txt`, docs/spec/lexicon-and-packs.md §3). A lower case in both is an error like one twice in a file.
+fn english_table() -> &'static HashMap<String, &'static str> {
+    static TABLE: std::sync::OnceLock<HashMap<String, &'static str>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| english_table_of(&ENGLISH_FILES).expect("data/english-extra.txt and data/lexicon/names-english.txt"))
+}
+const ENGLISH_FILES: [&str; 2] = [include_str!("../../data/english-extra.txt"), include_str!("../../data/lexicon/names-english.txt")];
+
+/// The table's rules: a line is `[A-Za-z]{3,32}` with an upper case letter (an all lower case line would change nothing), `#` lines and
+/// blank lines are skipped, and no two lines share a lower case.
+fn english_table_of(texts: &[&'static str]) -> Result<HashMap<String, &'static str>, String> {
+    let mut table = HashMap::new();
+    for line in texts.iter().flat_map(|t| t.lines()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let ok = (3..=32).contains(&line.len()) && line.bytes().all(|b| b.is_ascii_alphabetic()) && line.bytes().any(|b| b.is_ascii_uppercase());
+        if !ok || table.insert(line.to_ascii_lowercase(), line).is_some() {
+            return Err(format!("bad or repeated line: {line}"));
+        }
+    }
+    Ok(table)
+}
+
+/// docs/spec/english-mixed.md §4.4: how an English word typed as `typed` is written. All lower case, or with only its first letter
+/// upper case, and in the table: the table's line. Anything else the user typed with Shift on purpose: as typed.
+pub fn english_writing(typed: &str) -> String {
+    let lower = typed.to_ascii_lowercase();
+    let plain = typed.is_ascii() && typed.get(1..).is_some_and(|rest| rest == &lower[1..]);
+    match english_table().get(&lower).filter(|_| plain) {
+        Some(w) => w.to_string(),
+        None => typed.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod english_table_tests {
+    use super::*;
+
+    #[test]
+    fn the_table_loads_and_writes() {
+        assert!(english_table().len() > 200);
+        // Both files are in it.
+        for (typed, want) in [("nanako", "Nanako"), ("Cablate", "CabLate"), ("CABLATE", "CABLATE"), ("chatgpt", "ChatGPT"), ("Chatgpt", "ChatGPT"), ("CHATGPT", "CHATGPT"), ("cHatgpt", "cHatgpt"), ("ChatGPT", "ChatGPT"),
+            ("macos", "macOS"), ("Macos", "macOS"), ("rust", "rust"), ("Rust", "Rust"), ("", ""), ("a", "a"), ("gta6", "gta6")] {
+            assert_eq!(english_writing(typed), want, "{typed}");
+        }
+    }
+
+    #[test]
+    fn a_bad_table_is_refused() {
+        assert!(english_table_of(&["# c\n\nChatGPT\nGitHub\n"]).is_ok());
+        for bad in ["ChatGPT\nchatGPT\n", "npm\n", "AI\n", "GPT4\n", "Wi-Fi\n"] {
+            assert!(english_table_of(&[bad]).is_err(), "{bad}");
+            assert!(english_table_of(&["GitHub\n", bad]).is_err(), "{bad} in the second file");
+        }
+        // The same lower case in both files.
+        assert!(english_table_of(&["ChatGPT\n", "Nanako\n"]).is_ok());
+        assert!(english_table_of(&["ChatGPT\nNanako\n", "NaNaKo\n"]).is_err());
+        // The shipped files, one at a time: each is well formed alone, and each adds lines the other lacks.
+        let (a, b) = (english_table_of(&ENGLISH_FILES[..1]).unwrap(), english_table_of(&ENGLISH_FILES[1..]).unwrap());
+        assert!(a.len() > 200 && b.len() >= 5 && a.len() + b.len() == english_table().len());
     }
 }

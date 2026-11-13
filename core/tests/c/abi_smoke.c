@@ -236,6 +236,17 @@ static int run_lm(const char *dir, const char *lm, const char *missing) {
   o = 0;
   CHECK(840, shanjie_engine_reset(e, 1, &o) == 0 && o != 0);
   shanjie_output_free(o);
+  /* set_key_scheme (docs/spec/keys-and-composition.md §4.1): codes like set_candidate_vertical; 0 is the default and a snapshot with nothing shown. */
+  o = 0;
+  CHECK(850, shanjie_engine_set_key_scheme(0, 1, &o) == 1 && o == 0);
+  CHECK(851, shanjie_engine_set_key_scheme(e, 1, 0) == 1);
+  o = &dummy;
+  CHECK(852, shanjie_engine_set_key_scheme(e, 2, &o) == 2 && o == 0);
+  CHECK(853, shanjie_engine_set_key_scheme(e, 1, &o) == 0 && o != 0 && o->handled == 1 && o->candidate_count == 0);
+  shanjie_output_free(o);
+  o = 0;
+  CHECK(854, shanjie_engine_set_key_scheme(e, 0, &o) == 0 && o != 0 && o->handled == 1);
+  shanjie_output_free(o);
   /* set_abbreviation (docs/spec/prediction.md §6): codes like set_prediction; with it on, s then t are two units (preedit ㄋㄔ), and turning it off drops them. */
   o = 0;
   CHECK(820, shanjie_engine_set_abbreviation(0, 1, &o) == 1 && o == 0);
@@ -458,7 +469,7 @@ static int run_packs(const char *dir) {
   ShanjieEngine *e = 0;
   CHECK(701, shanjie_engine_new_packs(0, 0, 0, 0u, &e) == 1 && e == 0);
   CHECK(702, shanjie_engine_new_packs(dir, 0, 0, 1u, &e) == 1 && e == 0); /* a pack without a directory */
-  CHECK(703, shanjie_engine_new_packs(dir, 0, dir, (SHANJIE_PACK_ACG | SHANJIE_PACK_QUOTES | SHANJIE_PACK_IT | SHANJIE_PACK_BEAUTY) << 1, &e) == 2 && e == 0); /* a bit outside the mask */
+  CHECK(703, shanjie_engine_new_packs(dir, 0, dir, (SHANJIE_PACK_ACG | SHANJIE_PACK_QUOTES | SHANJIE_PACK_IT | SHANJIE_PACK_MEME | SHANJIE_PACK_BEAUTY) << 1, &e) == 2 && e == 0); /* a bit outside the mask */
   CHECK(704, shanjie_engine_new_packs(dir, 2u, 0, 0u, &e) == 2 && e == 0);   /* layout out of range */
   CHECK(705, shanjie_engine_new_packs(dir, 0, 0, 0u, &e) == 0 && e != 0);    /* mask 0: packs_dir may be NULL */
   shanjie_engine_free(e);
@@ -466,7 +477,7 @@ static int run_packs(const char *dir) {
   CHECK(706, shanjie_engine_new_packs(dir, 0, "/nonexistent/shanjie-packs", 1u, &e) == 0 && e != 0); /* a missing pack file adds nothing */
   shanjie_engine_free(e);
   e = 0;
-  CHECK(707, shanjie_engine_new_packs(dir, 0, "/nonexistent/shanjie-packs", SHANJIE_PACK_ACG | SHANJIE_PACK_QUOTES | SHANJIE_PACK_IT | SHANJIE_PACK_BEAUTY, &e) == 0 && e != 0); /* all four bits, no files */
+  CHECK(707, shanjie_engine_new_packs(dir, 0, "/nonexistent/shanjie-packs", SHANJIE_PACK_ACG | SHANJIE_PACK_QUOTES | SHANJIE_PACK_IT | SHANJIE_PACK_MEME | SHANJIE_PACK_BEAUTY, &e) == 0 && e != 0); /* all five bits, no files */
   shanjie_engine_free(e);
   return 0;
 }

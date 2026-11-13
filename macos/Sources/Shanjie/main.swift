@@ -58,7 +58,7 @@ final class DefaultsPredictionStore: PredictionStore {
         get { UserDefaults.standard.object(forKey: "prediction") as? Bool }
         set { UserDefaults.standard.set(newValue, forKey: "prediction") }
     }
-    /// docs/spec/prediction.md §9.4, key `browserFirstSyllable`; absent means on.
+    /// docs/spec/prediction.md §9.4, key `browserFirstSyllable`; absent means off.
     var browserFirstSyllable: Bool? {
         get { UserDefaults.standard.object(forKey: "browserFirstSyllable") as? Bool }
         set { UserDefaults.standard.set(newValue, forKey: "browserFirstSyllable") }
@@ -152,12 +152,43 @@ final class DefaultsBeautyPackStore: BeautyPackStore {
     }
 }
 
+/// The "迷因與實況用語" switch (docs/spec/lexicon-and-packs.md §4.2, §9.3), key `memePack` in the same domain; absent means on.
+@MainActor
+final class DefaultsMemePackStore: MemePackStore {
+    var memePack: Bool? {
+        get { UserDefaults.standard.object(forKey: "memePack") as? Bool }
+        set { UserDefaults.standard.set(newValue, forKey: "memePack") }
+    }
+}
+
 /// The 單按 Shift 切換中英 switch (docs/spec/keys-and-composition.md §9.1), key `shiftToggle` in the same domain; absent means off (docs/spec/english-mixed.md §10.1; on before that).
 @MainActor
 final class DefaultsShiftToggleStore: ShiftToggleStore {
     var shiftToggle: Bool? {
         get { UserDefaults.standard.object(forKey: "shiftToggle") as? Bool }
         set { UserDefaults.standard.set(newValue, forKey: "shiftToggle") }
+    }
+}
+
+/// The 記錄偶發問題的診斷資料 switch (docs/spec/macos-shell.md §13.3), key `diagLog` in the same domain; absent means on. Observes the key
+/// (KVO on UserDefaults also reports changes made by another process, such as `defaults write`) and empties the log on every change.
+@MainActor
+final class DefaultsDiagLogStore: NSObject, DiagLogStore {
+    var diagLog: Bool? {
+        get { UserDefaults.standard.object(forKey: "diagLog") as? Bool }
+        set { UserDefaults.standard.set(newValue, forKey: "diagLog") }
+    }
+
+    override init() {
+        super.init()
+        UserDefaults.standard.addObserver(self, forKeyPath: "diagLog", options: [], context: nil)
+    }
+
+    // ponytail: never removed; the store lives as long as `App.shell`, which is the whole process.
+    nonisolated override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?,
+                                           context: UnsafeMutableRawPointer?) {
+        let changed: @Sendable () -> Void = { MainActor.assumeIsolated { App.shell?.diag.storeChanged() } }
+        if Thread.isMainThread { changed() } else { DispatchQueue.main.async(execute: changed) }
     }
 }
 
@@ -245,8 +276,9 @@ final class DefaultsAppProfileStore: AppProfileStore {
     }
 }
 
-/// The update settings and the last check (docs/spec/install-and-update.md §2.2, §3.7, §7.2–§7.4): keys `updateAutoCheck` (Bool, absent
-/// means on), `updateLastCheck` (Date) and `updateStatus` (a dictionary of strings, see `UpdateStore`) in the same domain.
+/// The update settings and the last check (docs/spec/install-and-update.md §2.2, §3.3, §3.7, §3.8, §7.2–§7.4): keys `updateAutoCheck` (Bool, absent
+/// means on), `updateLastCheck` (Date), `updateStatus` (a dictionary of strings, see `UpdateStore`) and `updateNotify` (Bool, absent
+/// means on) in the same domain.
 @MainActor
 final class DefaultsUpdateStore: UpdateStore {
     var autoCheck: Bool? {
@@ -260,6 +292,10 @@ final class DefaultsUpdateStore: UpdateStore {
     var status: [String: String]? {
         get { UserDefaults.standard.dictionary(forKey: "updateStatus") as? [String: String] }
         set { UserDefaults.standard.set(newValue, forKey: "updateStatus") }
+    }
+    var notify: Bool? {
+        get { UserDefaults.standard.object(forKey: "updateNotify") as? Bool }
+        set { UserDefaults.standard.set(newValue, forKey: "updateNotify") }
     }
 }
 
@@ -289,19 +325,22 @@ func runServer() -> Never {
         // 可省略韻母 does not ship in v0.4.0; see Shell.showsAbbreviation. Flip to true to offer it again.
         // This argument alone hides it (Shell's default true is for the tests) and the app target has no tests: the release
         // device check confirms the menu has no 可省略韻母.
-        showsAbbreviation: false, spacingStore: DefaultsSpacingStore(), itPackStore: DefaultsItPackStore(), beautyPackStore: DefaultsBeautyPackStore(),
+        showsAbbreviation: false, spacingStore: DefaultsSpacingStore(), itPackStore: DefaultsItPackStore(), beautyPackStore: DefaultsBeautyPackStore(), memePackStore: DefaultsMemePackStore(),
         shiftToggleStore: DefaultsShiftToggleStore(), shiftHint: ShiftHintAdapter(),
-        englishNoticeStore: DefaultsEnglishNoticeStore(), englishNotice: EnglishNoticeAdapter())
+        englishNoticeStore: DefaultsEnglishNoticeStore(), englishNotice: EnglishNoticeAdapter(), diagLogStore: DefaultsDiagLogStore())
     // docs/spec/install-and-update.md §2.2, §3.7, §7.2–§7.4: the state always exists (the 關於 page shows the version); Sparkle starts only inside the .app.
     let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
     let updates = Updates(store: DefaultsUpdateStore(), version: version)
     App.shell?.updates = updates
     let updater = Updater(updates: updates)
+    // docs/spec/install-and-update.md §3.8: the notification center's delegate is set before app.run(), because a click on a
+    // notification while this process was not running starts it and delivers the click right at launch.
+    let notifier = UpdateNotifier(updates: updates)
     let settings = SettingsWindowController(shell: App.shell)
     App.shell?.onOpenSettings = { settings.show() }
     App.shell?.onOpenCandidateSettings = { settings.show(page: .candidates) }  // docs/spec/english-mixed.md §10.3
     updates.closeSettings = { settings.close() }
-    withExtendedLifetime((server, updater)) { app.run() }
+    withExtendedLifetime((server, updater, notifier)) { app.run() }
     exit(0)
 }
 

@@ -21,7 +21,7 @@ public final class SettingsModel: ObservableObject {
     @Published public private(set) var prediction = true
     @Published public private(set) var ghost = true
     /// 在瀏覽器裡，第一個字不顯示預測 (docs/spec/prediction.md §9.4), greyed while the prediction row is off.
-    @Published public private(set) var browserFirstSyllable = true
+    @Published public private(set) var browserFirstSyllable = false
     @Published public private(set) var abbreviation = false
     /// The 中英混打（實驗） toggle (docs/spec/english-mixed.md §1.1, §11), and whether it is enabled: the standard layout, like
     /// the menu item (false: the toggle is greyed, the setting kept).
@@ -63,6 +63,8 @@ public final class SettingsModel: ObservableObject {
     @Published public private(set) var itPack = true
     /// 美妝與保養詞 (docs/spec/lexicon-and-packs.md §4.2, §8.3): on until chosen otherwise.
     @Published public private(set) var beautyPack = true
+    /// 迷因與實況用語 (docs/spec/lexicon-and-packs.md §4.2, §9.3): on until chosen otherwise.
+    @Published public private(set) var memePack = true
     /// 單按 Shift 切換中英 (docs/spec/keys-and-composition.md §9.1). Default false since docs/spec/english-mixed.md §10.1.
     @Published public private(set) var shiftToggle = false
     /// The grey "資料更新至 …" line under the 動漫與遊戲詞 toggle (docs/spec/lexicon-and-packs.md §4.5): the same text as the menu's, `nil` for no line.
@@ -80,6 +82,14 @@ public final class SettingsModel: ObservableObject {
     /// this window belongs to no session.
     @Published public private(set) var pausedSecure = false
     @Published public private(set) var unavailable = false
+    /// 診斷 (docs/spec/macos-shell.md §13.3): the switch, and whether there is anything to copy (the button is greyed when not). The log
+    /// announces no change, so `diagLogEmpty` is read with the external state.
+    @Published public private(set) var diagLog = true
+    @Published public private(set) var diagLogEmpty = true
+    /// The text the preview sheet shows (docs/spec/macos-shell.md §13.3), taken once when it opens; `nil` while it is closed.
+    @Published public private(set) var diagPreview: String?
+    /// `DiagLog.clears` when the preview was taken: an emptying since (the switch changed outside the window) means 複製 copies nothing.
+    private var diagPreviewClears = 0
 
     public init(shell: Shell) {
         self.shell = shell
@@ -125,6 +135,7 @@ public final class SettingsModel: ObservableObject {
         quotePack = shell.quotePackOn
         itPack = shell.itPackOn
         beautyPack = shell.beautyPackOn
+        memePack = shell.memePackOn
         shiftToggle = shell.shiftToggleOn
         glassTint = shell.glassTint
         candidateVertical = shell.candidateVertical
@@ -138,7 +149,31 @@ public final class SettingsModel: ObservableObject {
         backupExcluded = shell.backupExcluded
         pausedSecure = shell.isSecureInput()
         unavailable = shell.learningUnavailable
+        diagLog = shell.diag.enabled
+        diagLogEmpty = shell.diag.isEmpty
+        // docs/spec/install-and-update.md §3.8: the user may have just changed it in System Settings and come back.
+        shell.updates?.refreshPermission()
     }
+
+    public func setDiagLog(_ on: Bool) {
+        shell.diag.enabled = on
+        refreshExternal()
+    }
+
+    /// 複製診斷紀錄…: the export, taken now, is what the sheet shows.
+    public func openDiagPreview() {
+        diagPreviewClears = shell.diag.clears
+        diagPreview = shell.diag.export(version: shell.updates?.version ?? "0.0.0")
+    }
+
+    /// 複製: the very text the sheet showed (not a new export), then the sheet closes. Nothing is copied when the log was emptied since the
+    /// sheet opened (turned off, or off and on, outside the window): those entries are gone.
+    public func copyDiagPreview(to pasteboard: DiagPasteboard) {
+        if let diagPreview, shell.diag.clears == diagPreviewClears { DiagLog.copy(diagPreview, to: pasteboard) }
+        diagPreview = nil
+    }
+
+    public func closeDiagPreview() { diagPreview = nil }
 
     public func selectLayout(_ m: InputMode) { shell.selectLayout(m) }
     public func setPrediction(_ on: Bool) { shell.applyPrediction(on) }
@@ -162,6 +197,7 @@ public final class SettingsModel: ObservableObject {
     public func setQuotePack(_ on: Bool) { shell.setQuotePack(on) }
     public func setItPack(_ on: Bool) { shell.setItPack(on) }
     public func setBeautyPack(_ on: Bool) { shell.setBeautyPack(on) }
+    public func setMemePack(_ on: Bool) { shell.setMemePack(on) }
     public func setShiftToggle(_ on: Bool) { shell.applyShiftToggle(on) }
     public func setBackupExcluded(_ on: Bool) {
         shell.setBackupExcluded(on)

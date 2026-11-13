@@ -97,11 +97,18 @@ public struct MenuEntry: Equatable, Sendable {
         case installUpdate
     }
 
+    /// docs/spec/macos-shell.md §7: what the app makes of the entry. A header is the system's menu section header
+    /// (`NSMenuItem.sectionHeader(title:)`), a separator `NSMenuItem.separator()`; neither carries an action.
+    public enum Kind: Equatable, Sendable { case item, header, separator }
+
     public var title: String
     public var action: Action?
     public var checked = false
     /// False: shown greyed (the checkmark still shows the setting). The app drops the action of a disabled entry.
     public var enabled = true
+    public var kind = Kind.item
+
+    public static let separator = MenuEntry(title: "", kind: .separator)
 
     /// Fixed strings (R2: no app name, path or count).
     public enum Text {
@@ -111,7 +118,7 @@ public struct MenuEntry: Equatable, Sendable {
         public static let prediction = "即時預測"
         /// The browser toggle under 即時預測 in the settings window and the line under it (docs/spec/prediction.md §9.4).
         public static let browserFirstSyllable = "在瀏覽器裡，第一個字不顯示預測"
-        public static let browserFirstSyllableNote = "在 Chrome 編輯 Google 文件時，第一個字回給輸入法的位置是錯的，預測列會跑到視窗左上角。Edge、Brave 等 Chromium 瀏覽器也一起套用。"
+        public static let browserFirstSyllableNote = "給 Chrome 156 以前（或同代的 Edge、Brave 等 Chromium 瀏覽器）的 Google 文件用：那些版本會把第一個字的預測列擺到視窗左上角。打開後，在這些瀏覽器裡第一個字一律不顯示預測列。Chrome 157 起不需要。"
         public static let english = "中英混打（實驗）"
         /// The line under that toggle in the settings window (docs/spec/english-mixed.md §1.1, §11).
         public static let englishDigitsNote = "打英文不用切換輸入法：打的字不可能是注音時直接變成英文，留在組字區；按空白才發現音節不存在（例如 so）也一樣，那一種要用 Backspace 修，不能按 Esc 變回注音；數字列的鍵也會打出數字（例如 2026年、3.14）。"
@@ -136,9 +143,10 @@ public struct MenuEntry: Equatable, Sendable {
         public static let quotePack = "經典台詞"
         public static let itPack = "資訊與 AI 詞"
         public static let beautyPack = "美妝與保養詞"
+        public static let memePack = "迷因與實況用語"
         public static func acgDataDate(_ date: String) -> String { "資料更新至 \(date)（維基百科）" }
-        /// The menu's non-clickable pack line (docs/spec/lexicon-and-packs.md §4.2, §4.3).
-        public static func packsOn(_ names: [String]) -> String { "已開啟的詞包：" + names.joined(separator: "、") }
+        /// The section header over the menu's non-clickable pack lines, one line per pack (docs/spec/lexicon-and-packs.md §4.2, §4.3).
+        public static let packsHeader = "已開啟的詞包"
         /// No app name in the title (docs/spec/macos-shell.md §5.3).
         public static let appChat = "這個 App 用聊天設定"
         public static let settings = "善解設定…"
@@ -291,10 +299,16 @@ extension Session {
         // docs/spec/semantic-rerank.md §8.2, §8.3 (F11): greyed while the demotion table is off or the small model did not load, where the core makes
         // no rerank job.
         items.append(MenuEntry(title: T.rerank, action: .toggleRerank, checked: shell.rerankOn, enabled: shell.rerankEnabled))
-        // docs/spec/lexicon-and-packs.md §4.2, §4.3: the pack switches live in Settings; the menu only names the packs the engine loaded, not clickable,
-        // and has no line when none is loaded (the ACG data date is shown under its switch in Settings).
+        // docs/spec/lexicon-and-packs.md §4.2, §4.3: the pack switches live in Settings; the menu only names the packs the engine loaded, under a
+        // section header, one non-clickable line each, between two separators (a header groups everything below it up to the next separator);
+        // nothing at all when none is loaded (the ACG data date is shown under its switch in Settings).
         let packs = shell.loadedPackTitles
-        if !packs.isEmpty { items.append(MenuEntry(title: T.packsOn(packs))) }
+        if !packs.isEmpty {
+            items.append(.separator)
+            items.append(MenuEntry(title: T.packsHeader, kind: .header))
+            items += packs.map { MenuEntry(title: $0) }
+            items.append(.separator)
+        }
         // docs/spec/macos-shell.md §5.3: absent without a bundle ID (nothing to store); greyed outside auto, checked as forced.
         if let bundle, !bundle.isEmpty {
             items.append(MenuEntry(title: T.appChat, action: .toggleAppChat, checked: profile(for: bundle) == Shell.chat,

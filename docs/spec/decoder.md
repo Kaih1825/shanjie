@@ -12,7 +12,7 @@
 
 | 輸入 | 檔案 | 作用 |
 |---|---|---|
-| 詞庫 | `mcbpmf-data.txt`（基底）、`overlay-add.tsv`、`sandhi-add.tsv`、`names-add.tsv`、選用詞包、`variant-order.tsv`、`demote.tsv`、`std-exempt.tsv` | 每個讀音下有哪些詞、各自的分數（log10） |
+| 詞庫 | `mcbpmf-data.txt`（基底）、`overlay-add.tsv`、`sandhi-add.tsv`、`names-add.tsv`、選用詞包、`variant-order.tsv`、`demote.tsv`、`std-exempt.tsv`、`rerank-protect.tsv`（只進重排遮罩，不加詞） | 每個讀音下有哪些詞、各自的分數（log10） |
 | 語言模型 | `bigram.sjlm` 加旁邊的 `classes.sjc`、`kn.sjkn`、`trigram.sjt3`（書面）、`trigram-chat.sjt3`（聊天） | 詞與詞的接續機率 |
 | 設定 | 設定（聊天或書面）、降權開關、模糊輸入位元 | 選 λ、表與扣分 |
 
@@ -60,7 +60,7 @@
 
 ### 2.5 選用詞包詞
 
-- 詞包列寫在詞包檔（目前 `acg-add.tsv`、`quotes-add.tsv`、`it-add.tsv`、`beauty-add.tsv`）的第 4 欄標籤。只有動漫詞包（`PACK_OOV`）的列用到下面的強制標籤 `acg-oov`；資訊、美妝詞包等照一般疊加層封頂。
+- 詞包列寫在詞包檔（目前 `acg-add.tsv`、`quotes-add.tsv`、`it-add.tsv`、`meme-add.tsv`、`beauty-add.tsv`）的第 4 欄標籤。只有動漫詞包（`PACK_OOV`）的列用到下面的強制標籤 `acg-oov`；資訊、迷因、美妝詞包等照一般疊加層封頂。
 - **強制詞**（第 4 欄 `acg-oov`）：解碼時被當成通語不認得的詞，分數就是詞包檔給的值，不封頂、不扣罰分。具體地，每個要用詞 id 的地方一律改用 `CappedLexicon::model_id`（強制詞回 `None`，其他詞回 `Lm::word_id`）：解碼的詞項與句尾項、解碼狀態記下的前一詞與前前詞、段落開頭的固定詞或前文詞、右邊接續的固定詞（`End::Next`）、`Engine::total_score` 走路徑的每個詞（`word3_in`／`eos3_in`／`word_learned_by_id` 吃 `Option<u32>`）。Python `cap_overlay` 與 `decode` 對同一組字串照樣當未知詞。
 - **非強制的詞包詞**（第 4 欄 `acg`）：照一般疊加層封頂，`model_id` 是 `Lm::word_id`；唯一差別是通語沒看過的（次數 0）不扣 `UNSEEN_OVERLAY_PENALTY`。
 - 不受影響的地方：`history()`（左邊前文以詞包詞結尾時仍記那個字串，只有拿它算分的地方經 `model_id` 變成未知詞）、候選窗、預測列、學習、降權表、會意的輸入、常談項。
@@ -178,14 +178,16 @@
 - `t(讀音, 字)`（`reading.rs` 的 `logp`）≤ 0，是該字這個讀音的詞庫（未封頂、取重複列最大值）分數減去該字最好讀音的分數；修正：
   - `SANDHI` 三個讀音（`ㄧˊ` 一、`ㄧˋ` 一、`ㄅㄨˊ` 不）t = 0，不看下一個音節是不是真的需要變調。
   - 分數剛好是 `LEX_FLOOR` = −6.8（詞庫對單字次要讀音沒有計數時給的底分）的（讀音, 字），改用多字詞估：`M(r, w) = 10^s(r,w) + Σ（基底裡每個含該字且該位置讀音為 r 的多字詞的 10^分數）`，t 取 `log10 M(r, w)` 減去該字各讀音中最大的 `log10 M`（同一個（讀音, 詞）重複列取最大值，依檔案首次出現的順序加總）。
+  - 讀音質量（`ReadingDecode::with_mass`，在讀完免扣清單之後建，因為資格看免扣後的 t）：單字 w 有 ≥ 2 個單字讀音、這些讀音現在的 t 全是 0、而且 w 是聲韻字（去掉 `ˊ ˇ ˋ ˙` 之後至少有兩個不同的音節；只差聲調或輕聲的字不動）時，每個讀音 r 的 `m(r)` ＝ `mcbpmf-data.txt` 原文裡至少兩字、某個位置是 w 讀 r 的詞條的 10^分數之和（同一個（讀音, 詞）重複列取最大值，依檔案首次出現的順序加總；只加多字詞，不含單字列自己的分數），`t'(r) = log10((m(r) + 1e-9) / (max m + 1e-9))`，max 取 w 的各個單字讀音。**只有 `t'(r) ≤ −MASS_MIN_DEDUCTION`（1.0，剛好 −1 也採用）的讀音改用 `t'(r)`**，其他維持 0；所有 m 都是 0 的字、`SANDHI` 三個讀音與免扣的（音節, 字）維持 0。出貨詞庫上共 132 對（`core/tests/fixtures/reading-mass-pins.tsv`，`core/tests/reading_mass.rs` 逐對斷言，其他對與不加規則時相同）。例：「莎」的 ㄕㄚ、ㄙㄨㄛ 單字同分，單打 ㄙㄨㄛ 原本第一名是「莎」，現在是「縮」（錯字回報第 184 列）。這是研究 repo `experiments/reading-counts-b3/` 變體 T3b 的規則；`λ`、`c` 不變，聲調字不動。
   - `std-exempt.tsv` 的（音節, 字）t = 0。出貨檔有 12 組（`ㄅㄛ 波`、`ㄆㄛˋ 朴`、`ㄇㄚ˙ 嗎`、`ㄌㄧ 哩`、`ㄌㄧㄣˋ 賃`、`ㄕㄨㄞˋ 率`、`ㄏㄜˊ 和`、`ㄏㄜˋ 嚇`、`ㄏㄨㄢˊ 還`、`ㄐㄧㄠˋ 教`、`ㄒㄧㄤ 相`、`ㄞˊ 癌`）：簡編本給該字的單一讀音、詞庫有這組、分數低於該字最好讀音、而且不在 `LEX_FLOOR`。`tools/std_exempt.py` 用這條規則重產它，`tools/test_std_exempt.py` 比對資料列；簡編本資料不在 repo，CI 缺資料時跳過。
   - 字或讀音在詞庫裡查不到的組合、以及字數 ≠ 1 的詞，項為 0。
 - 學習加分的詞（`was_boosted`）不加讀音項：讀音項最多扣 `LAMBDA·CAP` = 8，學習加分最多 6，否則使用者教過的罕用讀音會被蓋掉。句首單字學習的「抬高」解碼同樣加讀音項（和不抬高的分數相同，抬高的增益才是兩者差）。
 - 模糊音容錯讀音的字，讀音項用它的詞庫讀音算。
 - 建表只有一個函式 `engine::load_reading_decode(lexicon, data_dir)`，讀 `mcbpmf-data.txt` 原文與 `std-exempt.tsv`；`Engine::load_lm`、評測 CLI、重播程式都只呼叫它。缺檔、讀不了或格式錯（不是「音節<TAB>單一字」）就是載入失敗（回傳 3），不會靜默沒有豁免。
 - 開關：`Engine::set_reading_decode(false)`、CLI 與重播的 `--no-reading-decode` 只給評測用，不在 `shanjie.h`。關閉等於沒有讀音項的解碼器。
-- 摘要行：每個設定的標記最後都是 `+rd+rx:<std-exempt.tsv 的 SHA-256 前 8 碼>`；`--no-reading-decode` 時兩者都沒有。標記驗證工具（`tools/triage.py`、`tools/kpi.py`、`tools/bench.py`）依版本判定尾端是否應有它。
+- 摘要行：每個設定的標記最後都是 `+rd+rx:<std-exempt.tsv 的 SHA-256 前 8 碼>+rm`（`+rm` 是讀音質量規則）；`--no-reading-decode` 時都沒有。標記驗證工具（`tools/kpi.py`、`tools/bench.py`，以及不在本 repo 的研究工具）依版本判定尾端是否應有它。
 - 融合層沒有讀音通道項：`set_reading_channel`、`--no-reading-channel` 與標記 `+rc` 已不存在。
+- 研究用的表（只有 `shanjie-eval`，不在引擎與 `shanjie.h`）：`--dump-reading-table 檔` 把內建的 t 寫成 `字\t讀音\tt`（單字讀音至少 2 個的字，每個（字, 讀音）一行，照字與讀音排序，t 是讀音項的輸入、浮點用最短可還原的寫法；已有檔案時拒寫），寫完就結束、不印任何東西；`--reading-table 檔` 用該檔的 t 取代內建值（檔裡沒有的（字, 讀音）是 0；格式錯、詞庫沒有的字或讀音、重複的對都停下並說出行號），摘要標記在 `+rd+rx:…+rm` 後加 `+rt:<該檔 SHA-256 前 8 碼>`。兩個選項都要有讀音項（不能和 `--no-reading-decode` 並用），彼此也不能並用。用 `--dump-reading-table` 寫的檔去跑 `--reading-table`，每列選字與 `top1_sha256` 和不帶選項的一跑相同（`cli/tests/reading_decode.rs` 釘住）；不帶選項時輸出不變。
 - Python 參考實作不實作讀音項，所以和 Python 逐位元組比對的 golden 一律帶 `--no-reading-decode`；另有只有 Rust 的出貨預設釘值（dev302、打字測驗、錯字回報，兩個設定：摘要行與 `top1_sha256`）。
 - 取捨：讀音項放在解碼器本身而不是重排前的一步，因為 n-gram 只看字不看讀音，要在每一鍵、語意校正關著時也生效，光束才會用它剪枝。
 
@@ -232,7 +234,7 @@
 
 ## 7. 手動詞保護
 
-- 手動詞＝`overlay-add.tsv` 第 4 欄標籤是 `manual` 的列（由 `tools/build_overlay.py` 從 `overlay-manual.tsv` 接在後面，分數為該字數的 `S_len + MANUAL_BONUS`，`MANUAL_BONUS` = 0.75）。`Lexicon` 讀疊加層時收成 `ManualSet`（詞的字，讀音音節序列）；字數不等於音節數的列不收；其他標籤不收。引擎與評測 CLI 共用同一份，重排工作帶它（`Arc` 共用）。
+- 手動詞＝`overlay-add.tsv` 第 4 欄標籤是 `manual` 的列（由 `tools/build_overlay.py` 從 `overlay-manual.tsv` 接在後面，分數為該字數的 `S_len + MANUAL_BONUS`，`MANUAL_BONUS` = 0.75）。`Lexicon` 讀疊加層時收成 `ManualSet`（詞的字，讀音音節序列）；字數不等於音節數的列不收；其他標籤不收。另外 `data/lexicon/rerank-protect.tsv` 的詞（`docs/spec/lexicon-and-packs.md` §2.12，基底詞也可以）在載入詞庫時併進同一份 `ManualSet`，所以保護集合 = 手動詞加上重排保護詞；它們不改分數也不加詞條。引擎與評測 CLI 共用同一份，重排工作帶它（`Arc` 共用）。
 - 規則：語意校正某一段的 n-gram 第一名若在某個位置以那個手動詞的音節序列、字面上含有該手動詞，這一段就保護它；候選若沒有在同樣位置保有每一個被保護的手動詞，就在選擇時被遮掉（不能被選）。門檻（τ）與所有分數仍用完整清單算；第一名永遠保有，所以至少有一個可選。遮罩函式只有一個：`tinylm::manual_mask`（`TinyLm::rerank`、`rerank_colloquial`、`guarded_pick` 的退回路徑與評測 CLI 的 `--tinylm-scores` 都呼叫它；退回時也只能退到保有的候選）。
 - 音節序列用第一名路徑實際用的讀音（`Lexicon::path_readings`）：鄰鍵輸入把詞庫沒有的音節讀成替代讀音時，用那個詞庫讀音，所以手動詞經由容錯成為第一名時也受保護。
 - 沒有手動詞時完全照舊；`--tinylm-scores` 每列多一個欄位列出被遮掉的候選索引（沒有就是空）。
@@ -307,8 +309,8 @@
 ## 9. Python 參考實作與 CLI
 
 - `reference/proto/lm.py`、`trigram.py`、`ime.py` 實作 bigram、詞類、KN、trigram、異體排序表（`ime.py` 的 `load_variant_order`、`lm.py` 的 `cap_overlay`）、降權表（`load_demote`）、詞包詞當未知詞與前後同樣的合併規則，與 Rust 逐位元組相同；`fuzzy_ref.py` 是容錯表的對照。Python **不實作**讀音項、模糊輸入的解碼、學習。golden 由 Python 產生、Rust 比對。
-- 評測 CLI `shanjie-eval --lm MODEL --profile chat|formal`：預設載入 `classes.sjc`、旁邊的 `kn.sjkn` 與該設定自己的 trigram 表；旗標 `--context`（用每列前文定出第一個詞的歷史，摘要行設定欄寫成 `lm-chat+ctx`／`lm-formal+ctx`）、`--no-demote`、`--no-classes`、`--no-kn`、`--no-tri`、`--no-reading-decode`、`--fuzzy`、`--fuzzy-delta-sound`、`--packs`、`--rowstats`、`--dump`。
-- 摘要行標記一覽：`-nodemote`、`-noclasses`、`+kn:<sha8>:θ<θ>:β<β>`、`+tri:<sha8>`、`+fz:<flags>[:d<δ>]`、`+rd+rx:<sha8>`。
+- 評測 CLI `shanjie-eval --lm MODEL --profile chat|formal`：預設載入 `classes.sjc`、旁邊的 `kn.sjkn` 與該設定自己的 trigram 表；旗標 `--context`（用每列前文定出第一個詞的歷史，摘要行設定欄寫成 `lm-chat+ctx`／`lm-formal+ctx`）、`--no-demote`、`--no-classes`、`--no-kn`、`--no-tri`、`--no-reading-decode`、`--fuzzy`、`--fuzzy-delta-sound`、`--packs`、`--rowstats`、`--dump`、`--picks`（每列送出的句子與它的名次），以及語意校正的 `--tinylm`、`--tinylm-paired`（`docs/spec/semantic-rerank.md` §4.6、§10）。
+- 摘要行標記一覽：`-nodemote`、`-noclasses`、`+kn:<sha8>:θ<θ>:β<β>`、`+tri:<sha8>`、`+fz:<flags>[:d<δ>]`、`+rd+rx:<sha8>+rm`。
 - 重播程式（`shanjie-replay`）走引擎的 `load_lm`，標記與模型列同 CLI，另列出實際載入的每個模型檔。
 
 ## 10. 驗證

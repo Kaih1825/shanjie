@@ -6,7 +6,7 @@
 - 修正詞庫；
 - 改 Swift 殼或 Rust 核心。
 
-先看 README 的「進度」與「路線圖」，知道現在做到哪裡；現在的行為與規格在 `docs/spec/`，評測方法在 `docs/spec/evaluation.md`，建置、CI 與本機關卡在 `docs/spec/release-and-ci.md`。
+先看網站的「更新紀錄」與「路線圖」（https://shanjie.nyanako.com/updates 、https://shanjie.nyanako.com/roadmap ），知道現在做到哪裡；現在的行為與規格在 `docs/spec/`，評測方法在 `docs/spec/evaluation.md`，建置、CI 與本機關卡在 `docs/spec/release-and-ci.md`。
 
 ## 回報選錯的字
 
@@ -81,7 +81,7 @@ scripts/install-ime.sh "build/善解（開發版）.app"
 | `eval/` | 評測集，規則見 `eval/README.md` |
 | `tools/`、`scripts/` | 詞庫與模型的建置工具、打包與安裝腳本 |
 | `reference/` | Python 參考實作（`reference/proto/`，golden 檔的逐位元組對照） |
-| `docs/` | 現況規格（`docs/spec/`）、Release 說明（`docs/releases/`）、跨版本基準與 KPI 表 |
+| `docs/` | 現況規格（`docs/spec/`）、Release 說明（`docs/releases/`）；跨版本基準與每版 KPI 的公開數字在 `site/data/*.json`，網站的 /benchmark 與 /kpi 頁畫成表 |
 
 ## 怎麼提改動
 
@@ -118,7 +118,7 @@ PR 需要：
     ```
 
   - 前後比較用逐列統計：基準與新版各加 `--rowstats "$TMPDIR/before.rowstats"`／`--rowstats "$TMPDIR/after.rowstats"`（`--dev 302` 與 `--rows` 檔都可以），再跑 `python3 tools/evalstats.py compare "$TMPDIR/before.rowstats" "$TMPDIR/after.rowstats" --label dev302-chat`，把那一行表格貼進 PR（改對／改壞、McNemar p、CER、95% 區間）；dev302、打字測驗（`eval/dev/user-typing.txt`）、錯字回報檔在聊天與書面各一行；
-  - 解碼器有讀音項（`docs/spec/decoder.md` §5；評測 CLI 與重播預設都開，`--no-reading-decode` 關閉），而 Python 參考（`reference/proto/lm_eval.py`）沒有，所以 golden 有兩份：`eval/golden/s2h-lm-context.txt` 等 Python 逐位元組對照的檔，CLI 帶 `--no-reading-decode` 比對；`eval/golden/reading-decode-shipping.txt` 是只有 Rust 的出貨預設釘值（dev302、打字測驗、錯字回報，聊天與書面，各兩行：`--context` 的 n-gram，以及出貨旗標 `--context --packs acg,it,beauty --tinylm data/lm/tinylm.sjtl`、聊天另加 `--colloquial-core data/lm/colloquial.sjlm`）。往 `eval/dev/user-reported.txt` 加列時兩份都要更新：`make test-golden` 會指出哪幾行不同；Python 那份用 `reference/proto/lm_eval.py` 重新產生，Rust 那份用 `cli/tests/golden.rs` 的 `shipping_default_matches_its_rust_only_pins` 裡的指令重跑，換上新的摘要行。
+  - 解碼器有讀音項（`docs/spec/decoder.md` §5；評測 CLI 與重播預設都開，`--no-reading-decode` 關閉），而 Python 參考（`reference/proto/lm_eval.py`）沒有，所以 golden 有兩份：`eval/golden/s2h-lm-context.txt` 等 Python 逐位元組對照的檔，CLI 帶 `--no-reading-decode` 比對；`eval/golden/reading-decode-shipping.txt` 是只有 Rust 的出貨預設釘值（dev302、打字測驗、錯字回報，聊天與書面，各兩行：`--context` 的 n-gram，以及出貨旗標 `--context --packs acg,it,meme,beauty --tinylm data/lm/tinylm.sjtl`、聊天另加 `--colloquial-core data/lm/colloquial.sjlm`）。往 `eval/dev/user-reported.txt` 加列時兩份都要更新：`make test-golden` 會指出哪幾行不同；Python 那份用 `reference/proto/lm_eval.py` 重新產生，Rust 那份用 `cli/tests/golden.rs` 的 `shipping_default_matches_its_rust_only_pins` 裡的指令重跑，換上新的摘要行。
   - 只要求不退步：dev302 的聊天設定只報、不擋，書面照擋；聊天另由不在 repo 裡的調參集 cvtune-clean-tw0（正解不套 TWPhrases）守門，見 `docs/spec/evaluation.md` §6.1、§11.4；
   - 有進步的話寫出是哪幾句。
 - **對應的文件一起更新**：`docs/spec/` 的規格、README。
@@ -170,4 +170,5 @@ Signed-off-by: 你的名字 <你的 email>
 
 - 日誌只能記靜態字串與回傳碼，不能記組字、候選、按鍵或 App 名稱（`docs/spec/privacy.md` §3）。
 - 不能新增連網，除非是預設關閉、使用者明確開啟的功能（`docs/spec/privacy.md` §8）。
+- 診斷紀錄只能有列舉、布林與清理過的 bundle ID，只在記憶體、安全輸入時不記 Shift、不新增客戶端讀取（`docs/spec/privacy.md` §11）。
 - 不申請「輸入監控」或「輔助使用」權限；InputMethodKit 不需要。

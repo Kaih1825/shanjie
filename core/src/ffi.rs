@@ -353,7 +353,7 @@ pub unsafe extern "C" fn shanjie_engine_reset(
 /// S2c. Loads the bigram model at `path` (with `classes.sjc` beside it, and a `kn.sjkn` Kneser-Ney side file if one
 /// exists there: a broken or mismatching one fails the load with code 3, a valid one changes the scoring; the app
 /// ships one since model-v6; likewise the two optional trigram tables beside it, `trigram.sjt3` (the formal profile's) and `trigram-chat.sjt3` (the chat
-/// profile's), each a failure with code 3 when broken, both shipped by the app), reading `data_dir/overlay-add.tsv`, `names-add.tsv`, `demote.tsv`, `variant-order.tsv` and `std-exempt.tsv` (the reading term, docs/spec/decoder.md §5) again; any of them missing is code 3. Does not
+/// profile's), each a failure with code 3 when broken, both shipped by the app), reading `data_dir/overlay-add.tsv`, `names-add.tsv`, `demote.tsv`, `variant-order.tsv` and `std-exempt.tsv` (the reading term, docs/spec/decoder.md §5) again; any of them missing is code 3 (`rerank-protect.tsv` is read at engine creation only, docs/spec/lexicon-and-packs.md §2.12). Does not
 /// recompute the composition display. Any failure leaves the previous LM state (none or the old model).
 ///
 /// # Safety
@@ -590,6 +590,39 @@ pub unsafe extern "C" fn shanjie_engine_set_candidate_vertical(
         match e.set_candidate_vertical(enabled == 1) {
             // SAFETY: `out` checked non-NULL above.
             Ok(o) => unsafe { emit(o, out) },
+            Err(_) => SHANJIE_ERR_INTERNAL,
+        }
+    });
+    if rc == SHANJIE_ERR_INTERNAL {
+        // SAFETY: forwarded caller contract.
+        unsafe { discard(engine) };
+    }
+    rc
+}
+
+/// docs/spec/c-abi.md, docs/spec/keys-and-composition.md §4.1. `scheme` 0 (default) or 1: the key rules the engine follows; 1 adds the `m` rows (Microsoft Zhuyin habits, for the
+/// Windows text service). Returns the snapshot like `set_candidate_vertical`: an open candidate window keeps the scheme it opened with; any other value changes
+/// nothing and returns 2.
+///
+/// # Safety
+/// `engine` is NULL or a live handle; `out` is NULL or valid for one pointer write.
+#[no_mangle]
+pub unsafe extern "C" fn shanjie_engine_set_key_scheme(
+    engine: *mut ShanjieEngine,
+    scheme: u32,
+    out: *mut *mut ShanjieOutput,
+) -> i32 {
+    let rc = guard(|| {
+        // SAFETY: forwarded caller contract.
+        if !unsafe { clear_out(out) } || engine.is_null() {
+            return SHANJIE_ERR_NULL;
+        }
+        // SAFETY: live handle, single-threaded use (docs/spec/c-abi.md §1).
+        let e = unsafe { &mut (*engine).0 };
+        match e.set_key_scheme(scheme) {
+            // SAFETY: `out` checked non-NULL above.
+            Ok(Some(o)) => unsafe { emit(o, out) },
+            Ok(None) => SHANJIE_ERR_INVALID,
             Err(_) => SHANJIE_ERR_INTERNAL,
         }
     });
@@ -1220,6 +1253,8 @@ mod tests {
         std::fs::write(d.join("variant-order.tsv"), "").unwrap();
         // load_lm reads the reading-decode exemptions too (docs/spec/decoder.md §5): none here.
         std::fs::write(d.join("std-exempt.tsv"), "").unwrap();
+        // load_lexicon_split reads the rerank-protect words too (docs/spec/lexicon-and-packs.md §2.12): none here.
+        std::fs::write(d.join("rerank-protect.tsv"), "").unwrap();
         d
     }
 

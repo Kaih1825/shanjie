@@ -75,8 +75,8 @@ for lp in "zh-Hant|$NAME_ZH" "en|$NAME_EN"; do
     [ "$(pb "$k" "$S")" = "$name" ] || fail "$l InfoPlist.strings: $k"
   done
 done
-for f in mcbpmf-data.txt overlay-add.tsv sandhi-add.tsv names-add.tsv demote.tsv variant-order.tsv std-exempt.tsv digits.tsv models.tsv shanjie.tiff \
-         packs/acg-add.tsv packs/acg-sources.tsv packs/acg.json packs/it-add.tsv packs/it-sources.tsv packs/it.json packs/beauty-add.tsv packs/beauty-sources.tsv packs/beauty.json packs/quotes-add.tsv packs/quotes.json LICENSES/LICENSE LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/CC-BY-SA-4.0-attribution.txt \
+for f in mcbpmf-data.txt overlay-add.tsv sandhi-add.tsv names-add.tsv demote.tsv variant-order.tsv std-exempt.tsv rerank-protect.tsv digits.tsv mixed-words.tsv models.tsv shanjie.tiff \
+         packs/acg-add.tsv packs/acg-sources.tsv packs/acg.json packs/it-add.tsv packs/it-sources.tsv packs/it.json packs/beauty-add.tsv packs/beauty-sources.tsv packs/beauty.json packs/meme-add.tsv packs/meme-sources.tsv packs/meme.json packs/quotes-add.tsv packs/quotes.json LICENSES/LICENSE LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/CC-BY-SA-4.0-attribution.txt \
          LICENSES/name-suggestion-index-BSD-3-Clause.txt LICENSES/Sparkle-MIT.txt LICENSES/colloquial-attribution.tsv; do
   [ -s "$R/$f" ] || fail "Resources/$f is missing or empty"
 done
@@ -85,6 +85,8 @@ done
 cmp -s "$R/models.tsv" "$(dirname "$0")/../data/models.tsv" || fail "Resources/models.tsv differs from data/models.tsv"
 # digits.tsv is optional for the core (a missing table turns the feature off without a word), so the bundle must carry exactly the repo's.
 cmp -s "$R/digits.tsv" "$(dirname "$0")/../data/lexicon/digits.tsv" || fail "Resources/digits.tsv differs from data/lexicon/digits.tsv"
+# So is mixed-words.tsv (a missing or bad table leaves the mixed words out of the candidate list without a word).
+cmp -s "$R/mixed-words.tsv" "$(dirname "$0")/../data/lexicon/mixed-words.tsv" || fail "Resources/mixed-words.tsv differs from data/lexicon/mixed-words.tsv"
 # The app icon (docs/spec/macos-shell.md §1.4): compiled by actool, named in Info.plist.
 for f in Assets.car AppIcon.icns; do [ -s "$R/$f" ] || fail "Resources/$f (the app icon) is missing or empty"; done
 for k in CFBundleIconName CFBundleIconFile; do [ "$(pb "$k")" = AppIcon ] || fail "Info.plist $k is not AppIcon"; done
@@ -95,7 +97,7 @@ python3 - "$R/packs" <<'PY' || fail "packs/acg.json or packs/quotes.json does no
 import hashlib, json, os, sys
 d = sys.argv[1]
 # Explicit exits, not assert: PYTHONOPTIMIZE strips asserts and the check would pass vacuously.
-for manifest, required in (("acg.json", "acg-add.tsv"), ("quotes.json", "quotes-add.tsv"), ("it.json", "it-add.tsv"), ("beauty.json", "beauty-add.tsv")):     # quotes: docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2; IT+AI: docs/spec/lexicon-and-packs.md §4.2, §4.3; beauty: docs/spec/lexicon-and-packs.md §4.4, §8.3
+for manifest, required in (("acg.json", "acg-add.tsv"), ("quotes.json", "quotes-add.tsv"), ("it.json", "it-add.tsv"), ("beauty.json", "beauty-add.tsv"), ("meme.json", "meme-add.tsv")):     # quotes: docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2; IT+AI: docs/spec/lexicon-and-packs.md §4.2, §4.3; beauty: docs/spec/lexicon-and-packs.md §4.4, §8.3; meme: docs/spec/lexicon-and-packs.md §4.4, §9.3
     files = json.load(open(os.path.join(d, manifest), encoding="utf-8"))["files"]
     if required not in files:
         sys.exit(required + " is not in " + manifest)
@@ -106,6 +108,7 @@ for manifest, required in (("acg.json", "acg-add.tsv"), ("quotes.json", "quotes-
 PY
 grep -q 'packs/acg-add.tsv' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not list packs/acg-add.tsv"
 grep -q 'packs/it-add.tsv' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not list packs/it-add.tsv"
+grep -q '^packs/meme-add.tsv:' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file has no packs/meme-add.tsv paragraph"
 grep -q '政府資料開放授權條款' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not carry the Open Government Data License notice for the IT+AI pack"
 # The names layer (docs/spec/models.md §3.5, §8.1): the bundled file is the committed one, and the attribution file names it with its three
 # sources, the name-suggestion-index notice in full among them.
@@ -113,6 +116,8 @@ cmp -s "$R/names-add.tsv" "$ROOT/data/lexicon/names-add.tsv" || fail "Resources/
 # The reading term's exemptions (docs/spec/decoder.md §5): the core refuses to load a model without them, and the bundled file is the committed one.
 cmp -s "$R/std-exempt.tsv" "$ROOT/data/lexicon/std-exempt.tsv" || fail "Resources/std-exempt.tsv differs from data/lexicon/std-exempt.tsv"
 grep -q 'std-exempt.tsv' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not list std-exempt.tsv"
+# The rerank-protect words (docs/spec/lexicon-and-packs.md §2.12): the core refuses to load without them, and the bundled file is the committed one.
+cmp -s "$R/rerank-protect.tsv" "$ROOT/data/lexicon/rerank-protect.tsv" || fail "Resources/rerank-protect.tsv differs from data/lexicon/rerank-protect.tsv"
 for s in 'names-add.tsv' 'name-suggestion-index' 'Wikipedia contributors' '政府資料開放授權條款' 'Redistribution and use in source and binary forms'; do
   grep -qF "$s" "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not have: $s"
 done

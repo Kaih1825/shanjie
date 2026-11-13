@@ -19,6 +19,7 @@ enum TestData {
         ("demote.tsv", "data/lexicon/demote.tsv"),
         ("variant-order.tsv", "data/lexicon/variant-order.tsv"),  // docs/spec/decoder.md §2.3: required by the core like demote.tsv (engine creation and load_lm fail with 3 without it)
         ("std-exempt.tsv", "data/lexicon/std-exempt.tsv"),  // reading-decode-2: load_lm reads it (the decoder's reading term); missing, the load fails
+        ("rerank-protect.tsv", "data/lexicon/rerank-protect.tsv"),  // docs/spec/lexicon-and-packs.md §2.12: required by the core (engine creation fails with 3 without it)
         ("digits.tsv", "data/lexicon/digits.tsv"),  // docs/spec/english-mixed.md §7.2, §7.8: optional for the core, but the app bundles it
         ("bigram.sjlm", "data/lm/bigram.sjlm"),
         ("classes.sjc", "data/lm/classes.sjc"),
@@ -36,15 +37,22 @@ enum TestData {
     /// The beauty selftest word's row, verbatim from data/packs/beauty-add.tsv (Selftest.beautyWord), so the selftest tests do not depend on the generated file.
     static let beautySelftestRow = "ㄇㄟˊ-ㄘㄞˇ-ㄍㄠ\t眉彩膏\t-4.04116568\tbeauty\n"
     static let beautyPackKeys = "1u4xu3ru/ cj86"
+    /// The meme pack's one row, a made-up word the base lexicon cannot spell (core/tests/engine_pack.rs `MEME_PACK`: first candidate only with the pack, both profiles).
+    /// A fixture row, so the tests do not depend on the generated data/packs/meme-add.tsv. Typed as `memePackKeys` (a space is the first tone).
+    static let memePackRow = "ㄇㄧˊ-ㄧㄣ-ㄍㄨㄥˇ-ㄕˋ\t迷因公式\t-6.60980192\tmeme\n"
+    /// The meme selftest word's row, verbatim from data/packs/meme-add.tsv (Selftest.memeWord), so the selftest tests do not depend on the generated file.
+    static let memeSelftestRow = "ㄎㄜˇ-ㄧˇ-ㄙㄜˋ-ㄙㄜˋ\t可以色色\t-3.60980192\tmeme\n"
+    static let memePackKeys = "au6up ej/3g4"
 
     /// Adds Resources/packs/acg-add.tsv (a symlink to the repo's pack) like the app bundle has it. Opt-in: tests
     /// that write their own pack file into `packs` must not get a link through which they would overwrite the repo's.
-    static func addBundledPack(to dir: URL, itPack: Bool = true, beautyPack: Bool = true) throws {
+    static func addBundledPack(to dir: URL, itPack: Bool = true, beautyPack: Bool = true, memePack: Bool = true) throws {
         let packs = dir.appendingPathComponent("packs", isDirectory: true)
         try FileManager.default.createDirectory(at: packs, withIntermediateDirectories: true)
         // The IT+AI pack's one row (the selftest word, core/tests/engine_pack.rs): a real file, so the test does not depend on the generated data/packs/it-add.tsv.
         if itPack { try itPackRow.write(to: packs.appendingPathComponent("it-add.tsv"), atomically: true, encoding: .utf8) }
         if beautyPack { try beautySelftestRow.write(to: packs.appendingPathComponent("beauty-add.tsv"), atomically: true, encoding: .utf8) }
+        if memePack { try memeSelftestRow.write(to: packs.appendingPathComponent("meme-add.tsv"), atomically: true, encoding: .utf8) }
         try FileManager.default.createSymbolicLink(at: packs.appendingPathComponent("acg-add.tsv"),
                                                    withDestinationURL: repo.appendingPathComponent("data/packs/acg-add.tsv"))
     }
@@ -110,7 +118,8 @@ final class FakeClient: TextClient {
     func lineRect(cursor: Int) -> NSRect? { lineCursor = cursor; lineAsks += 1; return line }
     /// docs/spec/keys-and-composition.md §9.4: the insertion point's rectangle when nothing is marked.
     var caret: NSRect? = NSRect(x: 300, y: 400, width: 2, height: 18)
-    func caretRect() -> NSRect? { caret }
+    private(set) var caretAsks = 0
+    func caretRect() -> NSRect? { caretAsks += 1; return caret }
 
     /// Every call of the three reading methods, and each range requested.
     private(set) var reads = 0

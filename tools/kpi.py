@@ -12,9 +12,10 @@ this repository (bench.LEGACY_SHA) is exported from the legacy clone given by --
 `replay` runs in the CURRENT checkout (no changes to tracked files; if the tag --as exists it must be HEAD):
 `cargo build --release --locked -p cli --bin shanjie-replay --message-format=json` (the binary path is the compiler's own report) types the pinned user-reported and dev302 rows through the real engine
 with data/lm models and writes the `replay` field of eval/bench/kpi/<version>.json.
-`table` regenerates docs/kpi.md from eval/bench/results/v2-*.json and eval/bench/kpi/*.json and writes the public-set part of the same
-data to site/data/kpi.json (docs/spec/evaluation.md §8.4).
-tools/bench.py is imported, never changed. Never reads eval/holdout/ (the holdout halves are typed into the kpi JSON by hand).
+`table` reads eval/bench/results/v2-*.json and eval/bench/kpi/*.json, writes the public-set part to site/data/kpi.json, which the
+site's /kpi page draws (docs/spec/evaluation.md §8.4), and the full markdown table (private sets included) to --out FILE or
+$SHANJIE_TABLES/kpi.md, never inside this repository; without either it writes only the JSON.
+tools/bench.py is imported for its building blocks. Never reads eval/holdout/ (the holdout halves are typed into the kpi JSON by hand).
 """
 import argparse, ast, json, os, re, subprocess, sys, tempfile
 
@@ -23,9 +24,20 @@ import bench  # noqa: E402
 
 ROOT = bench.ROOT
 KPI_DIR = os.path.join(ROOT, "eval/bench/kpi")
-OUT = os.path.join(ROOT, "docs/kpi.md")
 SITE_JSON = os.path.join(ROOT, "site/data/kpi.json")
-LOAD_MAX = 2.0  # speed numbers only count when the machine was idle at both ends of the run
+# When speed numbers count (docs/spec/evaluation.md §8.2). Two rules, by what the result file recorded:
+# - the window rule, for a result that has `speed_load_after` (bench.py's `speed_window`, the machine's state right before and right after
+#   the speed measurement): Time Machine was not backing up at either end and the 1-minute load right after was at most
+#   SPEED_LOAD_AFTER_MAX. The load right before is recorded and not judged: the accuracy cells run before the speed measurement, so it
+#   carries bench's own work.
+# - the start rule, for the results before that (v0.7.0 and earlier): the 1-minute load when the whole run started was at most LOAD_MAX.
+#   It cannot see what starts after the run did (a backup that began two minutes into a v0.7.0 run slowed both versions by about 40%;
+#   that run's result was set aside and is in no tracked file, its numbers are from the local record of the run).
+# SPEED_LOAD_AFTER_MAX is provisional: it sits between the load after the two undisturbed v0.7.0 runs (2.77 in the result of c3ffeff2,
+# 4.25 in the current one) and the disturbed one (5.30, local record only), three runs in all. Set it again, and decide whether the load
+# before joins the rule, once three versions carry the new fields.
+LOAD_MAX = 2.0
+SPEED_LOAD_AFTER_MAX = 5.0
 # name -> (rows file, pinned sha256): the replay rows are frozen suite files, not eval/dev/*.
 REPLAY_ROWS = {"user-reported": bench.SETS2["user-reported"][:2], "dev302": bench.SETS2["dev302"][:2]}
 REPLAY_SUMMARY = re.compile(r"^## (\S+)  (\S+)  (\{.*\})$", re.M)
@@ -115,12 +127,14 @@ def cmd_run(a, kpi_dir=KPI_DIR):
 
 # ---------- replay: current checkout, data/lm models ----------
 def git_clean_head(root, version):
-    """HEAD of `root`, if no tracked file changed (untracked files, such as the results bench.py / kpi.py run just wrote, do not count)
+    """HEAD of `root`, if no tracked file changed (untracked files, such as the results bench.py / kpi.py run just wrote, do not count;
+    nor does this version's own kpi JSON, which `kpi.py run` rewrites when the version is measured again after its file was committed)
     and, when the tag `version` already exists, it points at HEAD."""
     if version in bench.LEGACY_SHA:   # this repository's tag of that name is not the version's commit (bench.LEGACY_SHA)
         die(f"{version} is a legacy version (commit {bench.LEGACY_SHA[version][:8]} of the legacy repository): replay measures the current checkout, "
             f"so run it from a checkout of that commit, not from this repository")
-    if bench.sh(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"]).strip():
+    own = os.path.relpath(KPI_DIR, ROOT) + f"/{version}.json"
+    if bench.sh(["git", "-C", root, "status", "--porcelain", "--untracked-files=no", "--", f":(top,exclude){own}"]).strip():
         die("a tracked file has changes: replay measures the commit it records")
     head = bench.sh(["git", "-C", root, "rev-parse", "HEAD"]).strip()
     t = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "--quiet", version + "^{commit}"], capture_output=True, text=True)
@@ -186,7 +200,7 @@ def replay_cell(binary, root, rows, models, learn, rowstats, packs, reading=Fals
     """One shanjie-replay run (chat, --correct); checks its models line, setting tag and row count. -> the summary dict.
     The replay loads data/lm/colloquial.sjlm by default, as the App does: a version that ships the table (it is in `models`) runs as is and its tag
     ends in +colloq:<sha8>+rc (the reading-channel term rides on the colloquial term, chat); one that does not ships no data/lm/colloquial.sjlm, and `--no-colloquial` keeps the replay from loading another.
-    A version with `"reading": True` in VERSIONS2 (the decoder's reading term, docs/spec/decoder.md §5) has no `+rc` and ends its tag in `+rd+rx:<sha8 of its data/lexicon/std-exempt.tsv>`."""
+    A version with `"reading": True` in VERSIONS2 (the decoder's reading term, docs/spec/decoder.md §5) has no `+rc` and ends its tag in `+rd+rx:<sha8 of its data/lexicon/std-exempt.tsv>+rm` (`+rm`: the reading-mass rule)."""
     cmd = [binary, "--rows", rows, "--profile", "chat", "--correct", "--learn", "on" if learn else "off", "--rowstats", rowstats]
     if "tinylm.sjtl" not in models:
         cmd.append("--no-tinylm")
@@ -206,7 +220,7 @@ def replay_cell(binary, root, rows, models, learn, rowstats, packs, reading=Fals
     want = f"replay-chat+ctx{packs}+nopred+noen+lm:{lm8}" + (f"+tl:{tl8}" if tl8 else "-notinylm") + ("+learn" if learn else "") + "+correct" \
         + (f"+colloq:{models['colloquial.sjlm'][:8]}" + ("" if reading else "+rc") if "colloquial.sjlm" in models else "")
     if reading:
-        want += f"+rd+rx:{bench.sha_file(os.path.join(root, 'data', 'lexicon', 'std-exempt.tsv'))[:8]}"
+        want += f"+rd+rx:{bench.sha_file(os.path.join(root, 'data', 'lexicon', 'std-exempt.tsv'))[:8]}+rm"
     if tag != want:
         raise RuntimeError(f"setting tag {tag} != {want}")
     n = len(bench.truths(rows))
@@ -323,17 +337,34 @@ def holdout_col(title, field):
     return title, f
 
 
+def speed_verdict(env):
+    """(rule, idle, the cell's text when not idle, the note after the numbers) for a result's machine block, or None when it recorded
+    neither rule's field. The window rule applies exactly when `speed_load_after` is there; a missing Time Machine field is unknown."""
+    if "speed_load_after" in env:
+        tms, after = (env.get("speed_tm_before"), env.get("speed_tm_after")), env["speed_load_after"]
+        if any(t is True for t in tms):   # a backup comes before the load as the reason
+            return "window", False, "—（備份中）", ""
+        if after > SPEED_LOAD_AFTER_MAX:
+            return "window", False, f"—（速度段後負載 {after:.2f}）", ""
+        return "window", True, None, "（備份狀態未知）" if any(t is None for t in tms) else ""
+    if "load_avg_start" not in env:
+        return None
+    load = env["load_avg_start"]
+    return ("start", False, f"—（負載 {load:.2f}）", "") if load > LOAD_MAX else ("start", True, None, "")
+
+
 def speed(x):
     s, env = get(x["rec"], "speed"), get(x["res"], "env")  # the column splits per machine (env.machine)
-    if not s or "p95_us" not in s or not env or "load_avg_start" not in env or "load_avg_end" not in env:
+    v = speed_verdict(env) if s and "p95_us" in s and env else None
+    if not v:
         return None
-    load = max(env["load_avg_start"], env["load_avg_end"])
-    if load > LOAD_MAX:
-        return env.get("machine"), None, f"—（負載 {load:.2f}）"
+    _, idle, reason, note = v
+    if not idle:
+        return env.get("machine"), None, reason
     t = f"按鍵 p95 {s['p95_us'] / 1000:.2f} ms"
     if "rerank_p95_ms" in s:
         t += f"／重排 p95 {s['rerank_p95_ms']:.1f} ms"
-    return env.get("machine"), None, t + f"／RSS {s['rss_mb']:.0f} MB"
+    return env.get("machine"), None, t + f"／RSS {s['rss_mb']:.0f} MB" + note
 
 
 COLUMNS = [
@@ -353,7 +384,7 @@ COLUMNS = [
 
 
 def load(results_dir, kpi_dir):
-    """-> (rows, kpi): the one read of the JSON files that both docs/kpi.md and site/data/kpi.json are made from.
+    """-> (rows, kpi): the one read of the JSON files that both the full table and site/data/kpi.json are made from.
     rows = [(version, {"rec", "res", "kpi"}, v2 file name or None)], newest first."""
     v2, kpi = load_json_dir(results_dir, "v2-"), {f[:-5]: d for f, d in load_json_dir(kpi_dir)}
     versions = {r["version"] for _, d in v2 for r in d.get("versions", []) if "version" in r} | set(kpi)
@@ -415,10 +446,16 @@ def site_row(x):
     if isinstance(h, dict) and "top1" in h and "n" in h:
         out["holdout_talk_chat"] = {k: h[k] for k in ("n", "top1", "fixed", "broken", "p", "rows_sha256") if k in h}
     s, env = get(x["rec"], "speed"), get(x["res"], "env")
-    if s and "p95_us" in s and env and "load_avg_start" in env and "load_avg_end" in env:
-        load = max(env["load_avg_start"], env["load_avg_end"])
-        out["speed"] = {"machine": env.get("machine"), "load_avg_max": load, "idle": load <= LOAD_MAX}
-        if load <= LOAD_MAX:   # the same rule as the table: numbers only from an idle window
+    v = speed_verdict(env) if s and "p95_us" in s and env else None
+    if v:   # the same verdict as the table's (`speed`)
+        rule, idle = v[:2]
+        if rule == "window":   # a row of the start rule keeps the shape it always had: no `rule` key
+            out["speed"] = {"machine": env.get("machine"), "rule": "window", "idle": idle, "speed_load_before": env.get("speed_load_before"),
+                            "speed_load_after": env["speed_load_after"], "speed_tm_before": env.get("speed_tm_before"),
+                            "speed_tm_after": env.get("speed_tm_after")}
+        else:
+            out["speed"] = {"machine": env.get("machine"), "load_avg_start": env["load_avg_start"], "idle": idle}
+        if idle:
             out["speed"].update({k: s[k] for k in ("p95_us", "rerank_p95_ms", "rss_mb") if k in s})
     return out
 
@@ -428,10 +465,11 @@ def site_data(rows, kpi):
 
 
 def cmd_table(a):
+    md = bench.md_path(a.out, "kpi.md", "kpi")
     rows, kpi = load(a.results, a.kpi)
-    with open(a.out, "w", encoding="utf-8") as f:
-        f.write(render_data(rows, kpi))
     bench.write_json(a.json, site_data(rows, kpi))
+    if md:
+        bench.write_md(md, render_data(rows, kpi))
 
 
 def main():
@@ -447,7 +485,7 @@ def main():
     t = sub.add_parser("table")
     t.add_argument("--results", default=bench.RESULTS)
     t.add_argument("--kpi", default=KPI_DIR)
-    t.add_argument("--out", default=OUT)
+    t.add_argument("--out", help="where to write the full table (default $SHANJIE_TABLES/kpi.md; never inside this repository)")
     t.add_argument("--json", default=SITE_JSON)
     a = ap.parse_args()
     {"run": cmd_run, "replay": cmd_replay, "table": cmd_table}[a.cmd](a)

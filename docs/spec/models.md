@@ -339,7 +339,7 @@ App 內附的模型只有一份清單：`data/models.tsv`。每列 `檔名<TAB>S
 
 ### 8.3 常談配對
 
-- 常談（`colloquial.sjlm`）只在聊天設定、載入的會意檔的 SHA-256 等於 `core/src/colloquial.rs` 的 `PAIRED_TINYLM_SHA256`（`356a37be…0a97c5de`）時生效（`colloquial::applies`）；其他情形核心的行為與沒有常談表時相同。換了會意檔卻沒換這個常數，常談會悄悄關掉，所以兩者要在同一個變更裡一起改，並用 CLI 聊天三檔的摘要行都有 `+colloq:81c2470d` 與新的 `+tl:<會意前 8 碼>` 確認。
+- 常談（`colloquial.sjlm`）只在聊天設定、載入的會意檔的 SHA-256 等於 `core/src/colloquial.rs` 的 `PAIRED_TINYLM_SHA256`（`356a37be…0a97c5de`）時生效（`colloquial::applies`）；其他情形核心的行為與沒有常談表時相同。（評測 CLI 的 `--tinylm-paired` 量測時略過這個雜湊條件，`docs/spec/semantic-rerank.md` §4.6；出貨的判斷不變）。換了會意檔卻沒換這個常數，常談會悄悄關掉，所以兩者要在同一個變更裡一起改，並用 CLI 聊天三檔的摘要行都有 `+colloq:81c2470d` 與新的 `+tl:<會意前 8 碼>` 確認。
 - 常談表的內容與融合：見 `docs/spec/semantic-rerank.md`。常談表只有口語計數（詞彙 69,457、二元組合 365,888 條），用通語的計數詞表重數：口語計數檔 ×1 加公開口語池 ×1，繁體句不套 `TWPhrases`，剪枝門檻 2；不含 g0v 與論壇語料（含了之後記憶體超過預算，保守檔在私人的聊天集合上顯著變差）。
 - 常談表的署名清單 `colloquial-attribution.tsv` 與常談表同一次建置，每列有來源與句數，不含句子文字；`data/lm/colloquial-attribution.tsv` 的雜湊記在 `data/colloquial-attribution.tsv.sha256`，App 打包進 `Resources/LICENSES/`。
 
@@ -520,7 +520,7 @@ shasum -a 256 -c data/bigram.sjlm.sha256 data/classes.sjc.sha256 data/kn.sjkn.sh
 
 - 舊的 Release 保留，可以回到那一版。
 - 發佈的通語要先加上來源辨識條目（§2.3）再算雜湊，詞類表也對加過的檔建。
-- 換版時同一個 PR 更新：雜湊檔（`data/*.sha256`）與 `data/models.tsv` 的那一列、CI 的 `scripts/fetch-models.sh` 與 `release.yml` 的下載、`cli/tests/golden.rs` 的雜湊與訊息、`core/tests/engine_*.rs` 的缺檔訊息、`macos/Tests/ShanjieKitTests/Support.swift`、`scripts/build-app.sh` 的提示與內附的署名文字、README、CONTRIBUTING、`LICENSES/data.md`、這份規格 §11 的表；換會意檔時另外照 `docs/releases/README.md` 的上傳與核對步驟。換會意檔而融合參數有變時，要重新確認 selftest 用的那一句仍會被重排改掉（`Selftest.rerankRowStandard`、`rerankedText`、`ngramText`，與測試的 `RerankRow`），不會就重挑一句。依模型的 golden 照各自的產生方式用 Python 參考實作重產，Rust 逐位元組相同。
+- 換版時同一個 PR 更新：雜湊檔（`data/*.sha256`）與 `data/models.tsv` 的那一列、CI 的 `scripts/fetch-models.sh` 與 `release.yml` 的下載、`cli/tests/golden.rs` 的雜湊與訊息、`core/tests/engine_*.rs` 的缺檔訊息、`macos/Tests/ShanjieKitTests/Support.swift`、`scripts/build-app.sh` 的提示與內附的署名文字、網站 `site/updates.html` 的「已合併、還沒發版」（發版時再改其他頁的模型名稱）、CONTRIBUTING、`LICENSES/data.md`、這份規格 §11 的表；換會意檔時另外照 `docs/releases/README.md` 的上傳與核對步驟。換會意檔而融合參數有變時，要重新確認 selftest 用的那一句仍會被重排改掉（`Selftest.rerankRowStandard`、`rerankedText`、`ngramText`，與測試的 `RerankRow`），不會就重挑一句。依模型的 golden 照各自的產生方式用 Python 參考實作重產，Rust 逐位元組相同。
 - 換檔順序：先把新雜湊合進 main 會讓 CI 拿舊檔對新雜湊而失敗，所以雜湊檔和 CI 下載在同一個切換的 PR 裡改；第一次加的新檔沒有人讀，雜湊檔可以和說明檔一起先進 main（`docs/releases/README.md`）。
 
 ## 13. 怎麼產生
