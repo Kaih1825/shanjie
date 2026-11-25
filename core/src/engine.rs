@@ -4555,7 +4555,11 @@ impl Engine {
                 self.open_candidates(old);
                 self.shown_first();
             }
-            KeyKind::Space | KeyKind::Down => self.open_candidates(old),
+            // Personal fork: in scheme 0 too, the window opens with the word the composition shows first (what the context chose).
+            KeyKind::Space | KeyKind::Down => {
+                self.open_candidates(old);
+                self.shown_first();
+            }
             // Key scheme 1, rule 16u: Up swaps the character before the cursor.
             KeyKind::Up if ms => return self.up_swap(old),
             KeyKind::Up => self.nothing(old),
@@ -5146,8 +5150,18 @@ impl Engine {
             self.variant_move(&mut list, &mut rows);
             return (list, HashMap::new(), rows, None);
         }
+        // Personal fork: the window is ordered by how common a word is, and a word read exactly as typed (tone included) is
+        // preferred over one reached through another tone or a slip. The prediction row's items stay at the top only when
+        // they were learned; its completions (readings longer than what was typed) are left to the ghost text and Tab.
+        if mixed.is_none() && rows.iter().any(|p| p.weight <= 0.0) {
+            rows.retain(|p| p.weight > 0.0);
+            list = rows.iter().map(|p| (p.word.clone(), p.reading.len())).collect();
+            seen = rows.iter().map(|p| p.word.clone()).collect();
+            list.extend(self.whole_item());
+        }
         let a = self.cursor;
         let today = if self.learner.has_new_words() { self.today() } else { 0 };
+        let mut score: HashMap<(String, usize), f64> = HashMap::new();
         for l in (1..=self.lex.max_len.max(NEWWORD_MAX).min(self.avail())).rev() {
             let key = if a == 0 { &self.syls[..l] } else { &self.syls[a - l..a] };
             let lexicon = self.lex.entries_with(key, self.colloq_on());
@@ -5156,31 +5170,78 @@ impl Engine {
             let new = if (NEWWORD_MIN..=NEWWORD_MAX).contains(&l) { self.learner.new_words_all(key, today) } else { Vec::new() };
             for w in new {
                 if !lexicon.iter().any(|(x, _)| *x == w) && seen.insert(w.to_string()) {
+                    score.insert((w.to_string(), l), 0.0);
                     list.push((w.to_string(), l));
                 }
             }
-            for (w, _) in lexicon {
+            for (w, sc) in lexicon {
                 if seen.insert(w.to_string()) {
+                    score.insert((w.to_string(), l), sc);
                     list.push((w.to_string(), l));
                 }
             }
         }
         self.variant_move(&mut list, &mut rows);
-        // Fuzzy input (docs/spec/decoder.md §6.2): after every exact word, the words found through one tolerant
-        // syllable, longer readings first, each reading's by score. Nothing is added with the flags 0 and only known syllables.
-        // Third-tone sandhi (docs/spec/decoder.md §6.6): the sandhi words of the same span after them, from the composition's position table.
-        let mut alt = HashMap::new();
+        // Fuzzy input (docs/spec/decoder.md §6.2) and third-tone sandhi (§6.6): each tolerant word gets its own lexicon score minus a
+        // penalty (another tone: TONE_PEN, any other slip: SLIP_PEN) and is merged into the exact words of its length by that score;
+        // the ones below every exact word of their length go to the end, as before.
+        const TONE_PEN: f64 = 2.0;
+        const SLIP_PEN: f64 = 3.0;
+        fn bare(s: &str) -> &str {
+            s.trim_start_matches('˙').trim_end_matches(['ˊ', 'ˇ', 'ˋ', '˙'])
+        }
+        let head = rows.len() + list[rows.len()..].iter().take_while(|(w, l)| !score.contains_key(&(w.clone(), *l))).count();
+        let mut tol: HashMap<usize, Vec<(String, Vec<String>, f64)>> = HashMap::new();
         let t3 = self.t3();
         for l in (1..=self.lex.max_len.min(self.avail())).rev() {
             let (from, to) = if a == 0 { (0, l) } else { (a - l, a) };
             let key = &self.syls[from..to];
             for (w, reading) in self.lex.tolerant_words(key, self.fuzzy, &t3[from..to]) {
                 if seen.insert(w.to_string()) {
-                    alt.insert(list.len(), reading);
-                    list.push((w.to_string(), l));
+                    let base = self.lex.entries_with(&reading, self.colloq_on()).iter().find(|(x, _)| *x == w).map_or(-8.0, |e| e.1);
+                    let tone_only = reading.iter().zip(key).all(|(x, y)| bare(x) == bare(y));
+                    let adj = base - if tone_only { TONE_PEN } else { SLIP_PEN };
+                    tol.entry(l).or_default().push((w.to_string(), reading, adj));
                 }
             }
         }
+        for v in tol.values_mut() {
+            v.sort_by(|x, y| y.2.total_cmp(&x.2));
+        }
+        let mut out: Vec<(String, usize)> = list[..head].to_vec();
+        let mut alt = HashMap::new();
+        let mut tail: Vec<(String, usize, Vec<String>)> = Vec::new();
+        let mut i = head;
+        while i < list.len() {
+            let l = list[i].1;
+            let mut group_end = i;
+            while group_end < list.len() && list[group_end].1 == l {
+                group_end += 1;
+            }
+            let mut pending: std::collections::VecDeque<(String, Vec<String>, f64)> = tol.remove(&l).unwrap_or_default().into();
+            for item in &list[i..group_end] {
+                let sc = score.get(item).copied().unwrap_or(0.0);
+                while pending.front().is_some_and(|t| t.2 > sc) {
+                    let (w, r, _) = pending.pop_front().unwrap();
+                    alt.insert(out.len(), r);
+                    out.push((w, l));
+                }
+                out.push(item.clone());
+            }
+            tail.extend(pending.into_iter().map(|(w, r, _)| (w, l, r)));
+            i = group_end;
+        }
+        // Lengths with tolerant words and no exact word at all.
+        let mut rest: Vec<usize> = tol.keys().copied().collect();
+        rest.sort_by(|x, y| y.cmp(x));
+        for l in rest {
+            tail.extend(tol.remove(&l).unwrap_or_default().into_iter().map(|(w, r, _)| (w, l, r)));
+        }
+        for (w, l, r) in tail {
+            alt.insert(out.len(), r);
+            out.push((w, l));
+        }
+        let list = out;
         (list, alt, rows, mixed)
     }
 
