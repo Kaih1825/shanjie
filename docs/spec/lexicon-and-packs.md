@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 基底 | `mcbpmf-data.txt`（小麥注音詞庫，MIT） | 無（三欄） | 無，原封不動 | 載入失敗 |
 | 疊加層 | `overlay-add.tsv` | `wikt`、`zhwiki`、`萌典補詞`、`manual`、`slang` | `tools/build_overlay.py` | 載入失敗 |
-| 變調層 | `sandhi-add.tsv` | `sandhi`、`neutral` | `tools/build_sandhi.py` | 載入失敗 |
+| 變調層 | `sandhi-add.tsv` | `sandhi`、`fusion`、`neutral`、`colloq` | `tools/build_sandhi.py` | 載入失敗 |
 | 名單層 | `names-add.tsv` | `names`、`creator`、`store` | `tools/build_names.py` | 載入失敗（評測 CLI 的 `--no-names` 例外） |
 | 動漫與遊戲詞包 | `acg-add.tsv` | `acg`、`acg-oov` | `tools/build_acg_pack.py` | 當作沒有這個詞包 |
 | 經典台詞詞包 | `quotes-add.tsv` | `quotes` | `tools/build_quote_pack.py` | 當作沒有這個詞包 |
@@ -23,7 +23,7 @@
 - `variant-order.tsv`（異體排序表）也在載入時讀，缺檔或有一行不成立都是載入失敗；它的格式與規則在 `docs/spec/decoder.md`，這份不重複。
 - `rerank-protect.tsv`（重排保護詞，§2.12）不是詞庫的一層，不加詞、不改分數：上表各層合併之後才讀，缺檔或有一列不成立都是載入失敗。
 - `names-english.txt`（名單層的英文寫法，§3.1）屬於名單層，但不是解碼的一層：一行一個英文寫法、沒有讀音與標籤欄，編進核心而不是載入的檔，所以沒有缺檔的情況，評測 CLI 的 `--no-names` 也不影響它；只在英文段結束時換大小寫（`docs/spec/english-mixed.md` §4.4）。
-- `mixed-words.tsv`（中英混合詞，`docs/spec/english-mixed.md` §5.7）也不是詞庫的一層：不進解碼，只在候選清單多一項；選用，缺檔或有一列不合規就整張不載入、不回錯誤。
+- `mixed-words.tsv`（中英混合詞，`docs/spec/english-mixed.md` §5.7）也不是詞庫的一層：候選清單多一項，解碼器在英文 token 後面把它的列當成一個可以選的詞（`docs/spec/decoder.md` §4.7），Shift＋字母的英文段照它切分、列預測；選用，缺檔或有一列不合規就整張不載入、不回錯誤。
 - 載入順序（`engine::load_lexicon_split`）：基底；接著疊加層文字 = `overlay-add.tsv`、`sandhi-add.tsv`、`names-add.tsv`、詞包列（動漫詞包先讀，其餘詞包依 `PACK_FILES` 的順序：動漫、經典台詞、資訊、迷因、美妝）、評測專用的 `--extra-overlay` 檔；每一段之間補一個換行。同一個讀音下的所有列最後一起穩定排序（見 §1.3）。
 - 一個要求的詞包，檔案不存在時什麼都不貢獻（引擎和沒有它逐位元組相同）；檔案存在卻讀不了或解析失敗是載入失敗。C ABI 與評測 CLI 的差別在 §4.1。
 - 封頂用的文字（`engine::capping_overlay`）= `overlay-add.tsv`、`names-add.tsv`、詞包列（沒有 `sandhi-add.tsv`）。封頂規則見 §1.4。
@@ -35,6 +35,7 @@
 - 疊加層類（疊加層、變調層、名單層、詞包）：每行 `讀音<TAB>詞<TAB>分數<TAB>標籤`，剛好四欄，沒有標頭、沒有註解行。四欄不足、超過或分數不是數字的列是壞列：解析到它就停；它只在沒有更早的重複列時才被回報（`BadOverlayRow`，只帶那一行的字數）。
 - 疊加層列接在基底後面：同一個（讀音, 詞）若已出現在更早的列（基底或疊加層），回 `OverlayDuplicate`（只帶詞的字數；同時有好幾個時回檔案順序最前的那一個）；全部沒有列是 `EmptyLexicon`。
 - 錯誤只帶種類與長度，不帶輸入文字（隱私規則見 `docs/spec/privacy.md`）。
+- 標籤是 `colloq` 的列（疊字陰平化的口語讀音，`docs/spec/decoder.md` §8.7；`sandhi-add.tsv` 與 `overlay-add.tsv` 都有）不進上面的詞條，另外存一份：讀音各自排序、同讀音照分數排，只用到它們的音節另外編號（不算詞庫的音節，`has_syllable`、容錯表、單字詞條的判斷都看不到）。只有 `Lexicon::colloq_range`（以及帶開關參數的 `entries_with`、`has_with`、`CappedLexicon::best_lp_with`、`best_lp_delta_with`）讀得到，呼叫的人決定開關：解碼器與引擎在「變調與口語讀音」開著時把它們當成那個讀音的詞條，關掉時等於沒有這些列（`docs/spec/decoder.md` §6.6）。它們的詞照一般規則封頂（§1.4），不參加重複列檢查、異體排序與 `by_word`；字數不等於音節數的列不收。
 - 標籤是 `manual` 的列另外收成 `ManualSet`（詞的字與讀音音節序列；字數不等於音節數的列不收），由引擎與評測 CLI 共用，供語意校正保護手動詞（`docs/spec/semantic-rerank.md`）。
 
 ### 1.3 內部結構與排序
@@ -105,6 +106,13 @@
 
 候選詞若只是別的寫法（簡體寫法轉成繁體後的詞、台灣字形摺疊後與基底或已留下的疊加層詞同讀音同字串的異體），就不寫進檔案；被拿掉的詞與它的落點寫到 `build/overlay/overlay-removed.tsv`、`overlay-variant-removed.tsv`（不進版控）。規則的內容（簡繁判斷、`MERGE` 摺疊表、落點分兩階段判定）見 `docs/spec/decoder.md`。粵語詞在候選階段就拿掉，所以這兩條規則看不到它們。
 
+上面兩條之後，產生的列（維基來源、`萌典補詞`、`lexgap`）再過兩道，被拿掉的詞每一列都拿掉（含變調列）：
+
+- **整詞的簡體寫法**（`phrase_twin`）：詞整個是簡繁詞組表（OpenCC `STPhrases` 加 `tw-conv.tsv` 選定的值）的鍵、值是另一個寫法、那個寫法在基底，而且詞不是萌典詞目，就拿掉（松散→鬆散、取舍→取捨、船只→船隻）；記進 `overlay-removed.tsv`。上一條的簡體判斷（`is_simplified`）只數簡體專用字與標記字，這些詞的每個字台灣也用，句子判成繁體，詞組表就沒被查到。只查整詞的鍵（最長比對會把「花卷市」改成「花捲市」）；目標只在疊加層、不在基底的不動。
+- **審過的錯字寫法**（`data/lexicon/overlay-drop.tsv`，CC0）：每列 `詞<TAB>基底的正確寫法<TAB>備註`，`#` 與空行略過；詞不能在基底、正確寫法要在基底、同一個詞只能一列，不符就中止並指出行號。清單裡的詞不寫，記進 `overlay-variant-removed.tsv`。錯字寫法沒有表可查（「好高鶩遠」的「鶩」與「騖」不是異體字，讀音又和基底的「好高騖遠」不同列），所以是清單，不是規則。
+
+`--tails-only` 也套用清單（清單在 repo 裡，不必有 dump）；`--tails-only --refilter` 另外把整詞的簡體寫法規則套到留著的列（要 OpenCC 表與 `SHANJIE_MOEDICT`，缺了就中止），給沒有 dump 的機器用。測試：`tools/test_build_overlay.py` 的 `LateRemovals`（真值表、清單格式、完整建置兩道都走、已提交的檔裡沒有清單的詞；有 OpenCC 表與萌典的機器另外核對已提交的檔沒有任何一列會被整詞規則拿掉，沒有時印 NOTE）。
+
 ### 2.4 讀音
 
 - 預設：`ime.Lexicon.to_syllables`（把詞切成基底詞，每段取分數最高的讀音），轉不出讀音的詞略過；不做人工確認。
@@ -138,14 +146,17 @@
 ### 2.9 手動詞（`data/lexicon/overlay-manual.tsv`）
 
 - 欄位：詞、讀音（音節以空白分隔；同一個詞要兩個讀音就寫兩列）、備註；`#` 開頭與空行略過；CC0。標籤 `manual`。
-- 每列要：純漢字、字數在分數表裡（2 以上）、讀音音節數等於字數且每個音節基底都有、詞不在基底／疊加層／名單層／動漫與資訊詞包（`taken`）；產生的列（含變調列）同一個（讀音, 詞）不能出現兩次。不符就中止並指出檔名與行號。
-- 分數 = 同字數的 `length_scores` + `MANUAL_BONUS`（0.75）。
+- 每列要：純漢字、字數在分數表裡（2 以上）、讀音音節數等於字數且每個音節基底都有、詞不在疊加層／名單層／任何詞包（`data/packs/*-add.tsv`：動漫、資訊、迷因、美妝、經典台詞）；產生的列（含變調列）同一個（讀音, 詞）不能出現兩次。不符就中止並指出檔名與行號。
+- **補讀音**：詞可以是基底詞，用來補基底沒有的讀音（例：「為啥」基底只有 ㄨㄟˊ ㄕㄚˊ，手動列補 ㄨㄟˋ ㄕㄚˊ；「部署」基底只有 ㄅㄨˋ ㄕㄨˋ，手動列補 ㄅㄨˋ ㄕㄨˇ）。條件是這一列產生的每個（讀音, 詞）（含變調列）都不在基底，也不在 `sandhi-add.tsv` 的任何一列（含 `colloq` 列）：核心把 `sandhi-add.tsv` 接在 `overlay-add.tsv` 後面當同一份疊加層文字，同一對出現在兩個檔的一般列，引擎載入失敗；`colloq` 列另外收、不查重複，不會載入失敗，但 `build_sandhi.py` 重產時兩種都會默默拿掉 `sandhi-add.tsv` 的那一列。撞到就中止並指出檔名與行號（`tools/build_overlay.py` 的 `fixed_pairs`、`manual_rows`）。備註寫讀音的依據。網路用語（§2.10）不適用，照舊不能是基底詞。
+  - 這種詞的字串進了疊加層，所以照 §1.4 在它**所有**讀音下封頂（包括基底原本的讀音）；「為啥」「不足為外人道」兩列加入時，出貨設定在 cdev、cvtune-clean-tw0、wikitune-clean-tw0、dev302、打字測驗、錯字回報上逐列相同；「部署」加入、補讀音列改取基底分數時，同樣的集合只有錯字回報變了：兩種設定各改對 2 列（第 119、199 列，都是照 ㄕㄨˇ 打的「部署」）、改壞 0。
+  - 只在不帶語意校正時才看得出差別：重排有時會把基底詞換回第一名，App 的重排在背景跑、來不及時送出的是 n-gram 的第一名。測試 `cli/tests/golden.rs` 的 `manual_reading_refills_are_the_ngram_first_choice` 釘住 n-gram 本身（出貨詞包、不帶 `--tinylm`），兩種讀音下第一名都是那個詞。
+- 分數 = 同字數的 `length_scores` + `MANUAL_BONUS`（0.75）。補讀音的列取這個分數與那個詞在基底、`sandhi-add.tsv` 的最高分中較大的：同一個詞換一個讀音，常用的程度不變。例：「部署」基底 −5.19，長度分數加 0.75 是 −6.42；用後者時聊天的 n-gram 在 ㄅㄨˋ ㄕㄨˇ 下選「部屬」。「為啥」因此從 −6.42 升到基底的 −5.79，「不足為外人道」的基底分數比較低，不變。
 - 取捨：0.75 讓目前所有手動詞在出貨設定（兩種設定、三種強度）下單獨與放在句子裡都排第一；0.5 時開 KN 的模型在書面設定下有一句會輸；測試 `cli/tests/golden.rs` 的 `manual_words_come_first_in_the_shipping_setting` 逐詞檢查（列在 `eval/golden/manual-words-rows.txt`）。
 
 ### 2.10 網路用語（`data/lexicon/slang-add.tsv`）
 
 - 欄位：詞、讀音、來源，可選的第四欄「加分」；標籤 `slang`；CC BY-SA 4.0（來源見下）；是建置輸入，不隨 App 內附（內容已在 `overlay-add.tsv`）。
-- 建置（`tail_rows`）：接在手動詞後面，檢查規則同手動詞（詞也不能是手動詞、名單層、動漫／資訊詞包的詞），分數 = `length_scores` + `MANUAL_BONUS` + 加分。沒有這個檔時輸出與沒有網路用語的疊加層逐位元組相同。
+- 建置（`tail_rows`）：接在手動詞後面，檢查規則同手動詞（詞也不能是手動詞、名單層或任何詞包（`data/packs/*-add.tsv`）的詞），分數 = `length_scores` + `MANUAL_BONUS` + 加分。沒有這個檔時輸出與沒有網路用語的疊加層逐位元組相同。
 - 同一個讀音有好幾個網路用語時，檔案裡排前面的留第一，同讀音第 k 個（k 從 0 起）的列再扣 k × `SLANG_BEHIND`（1.0），只當候選；所以檔案順序有意義，新增詞要插在對的位置（用量多的在前）。
 - 加分：只能放在同讀音的第一列，必須是 0.5 的倍數且 0 < 加分 ≤ `BOOST_MAX`（3.0）；放在被扣分的列上會讓它與第一名打平或超過，建置中止。用途：詞庫分數輸給「沒人這樣講的組合」時抬高。核心把模型看過的疊加層詞封頂在語料頻率，所以加分只對模型沒看過的詞有效。
 - 收錄準則（來源檔的內容準則，建置工具不檢查）：來源是公開維基與維基詞典的條目標題（CC BY-SA 4.0）、網路社群百科的條目標題（Fandom，文字 CC BY-SA 3.0，依後續版本條款以 4.0 散布）、外部語言模型建議的字串（只取字串）、人工補的詞（CC0）；只取詞的字串，不取解釋文字。台灣公開論壇的文章與推文用量只用來確認收錄與排序，只取詞的字串與計數、不含原文：直接從語料挖出的字串要分區 ≥ 3、文章 ≥ 10，人或模型挑過的候選要分區 ≥ 2、文章 ≥ 3（最早一批較嚴：分區 ≥ 5、文章 ≥ 20）。只收台灣在用的說法，不收只在中國大陸用的、人名與網名（歸名單層）、有明確單一出處的台詞（歸經典台詞詞包）。同音時，原本的第一名（X）的文章數 ≥ 候選就不收（文章數多的留第一）；X 是沒人這樣講的組合時才在第四欄加分。挖掘與分類的腳本不隨 repo 散布，`slang-add.tsv` 是人工審過、提交進 repo 的輸入。
@@ -155,7 +166,7 @@
 
 - `python3 tools/build_overlay.py`：產生並寫入（需要 dump；萌典補詞需要 `--moedict-supplement` 給語料檔；§2.7、§2.8 與 `--lexgap`（§2.1）的旗標預設關，不帶旗標的輸出只含維基來源的列，所以和含 `萌典補詞` 列的提交檔不同）。
 - `python3 tools/build_overlay.py --check`：重新產生並與提交的檔案比對（旗標要和建出提交檔的那一組相同）；不同 exit 1。
-- `python3 tools/build_overlay.py --tails-only`：不讀 dump，保留 `overlay-add.tsv` 中標籤不是 `manual`、`slang` 的列，只重算檔尾；改了手動詞或網路用語時用。不能和 `--lexgap` 一起用（`lexgap` 的列要完整建置才能核對；一起給、或 `--lexgap` 給空字串，都是用法錯誤、exit 2）。
+- `python3 tools/build_overlay.py --tails-only`：不讀 dump，保留 `overlay-add.tsv` 中標籤不是 `manual`、`slang`、`colloq` 的列，重算 `colloq` 列（`docs/spec/decoder.md` §8.7，接在產生的列之後）與檔尾；改了手動詞、網路用語或 `overlay-drop.tsv` 時用（`--refilter` 見 §2.3）。不能和 `--lexgap` 一起用（`lexgap` 的列要完整建置才能核對；一起給、或 `--lexgap` 給空字串，都是用法錯誤、exit 2）。
 - 沒有 dump 的機器：`tools/test_build_overlay.py` 核對檔尾、粵語詞與各旗標的行為（`make test-python` 與 CI 的「Overlay manual words and readings」步驟都跑）。
 
 ### 2.12 重排保護詞（`data/lexicon/rerank-protect.tsv`）
@@ -247,7 +258,7 @@
 | 美妝與保養詞 | 16（`SHANJIE_PACK_BEAUTY`／`PACK_BEAUTY`） | `beauty-add.tsv` | `beauty` |
 
 - `shanjie_engine_new_packs(data_dir, layout, packs_dir, packs, out)`：`packs` 是位元遮罩，遮罩 0 忽略 `packs_dir`（可為 NULL），等於 `shanjie_engine_new`。回傳碼：1 = `packs_dir` 是 NULL 而遮罩非 0（或其他空指標）、2 = 遮罩有未知的位元或路徑不是 UTF-8、3 = 詞包檔存在卻讀不了或解析失敗（也包括基底、疊加層、名單層、變調層載入失敗）。
-- 詞包列併進詞庫，所以一個引擎的詞包組合是固定的；殼用「釋放引擎、再建一個」切換，和換鍵盤排列相同。遮罩內缺檔的詞包什麼都不貢獻。
+- 詞包列併進詞庫，所以一個引擎的詞包組合是固定的；殼在背景建另一個引擎（現行引擎繼續處理按鍵，可沿用它已載入的模型與表，`docs/spec/macos-shell.md` §2.1），建好、組字區空了才換掉舊的。遮罩內缺檔的詞包什麼都不貢獻。
 - 關掉的詞包不讀檔：選字結果、候選清單與預測和沒有那個詞包檔的引擎逐位元組相同。
 - 評測 CLI：`--packs acg|quotes|it|meme|beauty` 或逗號串列，`--packs-dir DIR`（預設 `data/packs`）。要求的詞包檔不存在時 CLI 報錯並印路徑（引擎不報錯，這是 CLI 與引擎的差別）；單用 `--packs-dir` 沒有 `--packs` 是錯誤；兩個檢查都在讀模型之前。摘要行在載入詞包時依序多 `+acg`、`+quotes`、`+it`、`+meme`、`+beauty` 標記，沒有詞包時一字不變。`PACKS=acg,it,meme,beauty`（`PACKS_DIR` 預設 `data/packs`）讓 `core/tests/engine_predict.rs` 的延遲測試載入出貨的遮罩，並斷言詞庫列數等於基底加所列詞包。
 - 驗證：`core/tests/engine_pack.rs`（`the_pack_switch_changes_the_result_and_off_is_identical_to_no_pack_file`、`the_it_pack_has_its_own_bit_and_file`、`the_meme_pack_has_its_own_bit_and_file`、`an_unknown_pack_bit_is_refused`、`the_quote_bit_reads_quotes_add_tsv_only`、`the_names_layer_is_capped_on_the_engine_path`、`an_anime_pack_word_keeps_its_score_on_the_engine_path`）；`cli/tests/golden.rs` 的 `packs_options_fail_loudly`、`unreadable_pack_file_names_the_path_and_kind`、`unparsable_pack_is_a_parse_error`。
@@ -263,20 +274,20 @@
 | 迷因與實況用語 | `memePack` | 開 | 迷因與實況用語 |
 
 - 開關只在設定視窗「詞包」區塊，依序動漫、經典台詞、資訊、美妝、迷因；新詞包加在這一區。「動漫與遊戲詞」下方有一行灰字「資料更新至 YYYY-MM-DD（維基百科）」，日期取 `Resources/packs/acg.json` 的 `latest_source_revision`（UTC 日期，讀一次；檔案缺、欄位缺或讀不了就不顯示）；詞包關掉時照樣顯示。
-- 切換一個詞包：先把組字送出，再改設定並寫入偏好，再重建引擎（同值不做任何事）。
+- 切換一個詞包：改開關、寫入偏好、發 `didChangeSettings`，再交給背景建置（同值不做任何事）；不送出組字，現行引擎繼續用，新引擎建好、組字區空了才換上，換上之後選單才列新的組合（`docs/spec/macos-shell.md` §2.1）。
 - 輸入選單沒有詞包開關，只有一段不能點的「已開啟的詞包」：系統的選單小標題「已開啟的詞包」，下面依設定順序每個詞包一行，列引擎**實際載入**的詞包（`loadedPackMask`：照設定的遮罩建成功就是它，缺檔的詞包不算；退回後只含留下的詞包），前後各一條分隔線（`docs/spec/macos-shell.md` §7）。每個詞包各一行，不寫成一長行，選單不會隨詞包變多而變寬。一個都沒載入就整段不顯示。選單不讀偏好值。
 - 遮罩（`packMask`）= 各開關為開的位元；一個從沒動過任何開關的 App 建出遮罩 29（動漫、資訊、迷因、美妝）。
 
 ### 4.3 載入失敗的退回
 
-合併建置失敗時（`Shell.build`）：
+合併建置失敗時（同步的 `Shell.build` 與詞包切換的背景建置共用 `PackBuild.run`；背景建置走共用路徑時，每一次嘗試都是 `shanjie_engine_new_shared`，順序與次數相同）：
 
 1. 先建一個不帶詞包的引擎，只為判斷是不是詞包的錯，建完立刻釋放；只有一個啟用的詞包檔案在時（只開一個詞包，或其他開著的詞包缺檔）沒有「少一個」可試，這個引擎成功就直接留下當引擎（共建兩次），不釋放再建；
-2. 它也失敗：原因不是詞包，記兩個回傳碼，不再嘗試，沒有引擎（所有按鍵直通）；
+2. 它也失敗：原因不是詞包，記兩個回傳碼，不再嘗試；同步建置沒有引擎（所有按鍵直通），詞包切換的背景建置沒有結果、留在現行引擎；
 3. 它成功：對每個啟用、檔案也在的詞包依設定順序各試「少這一個」（`mask & ~bit`；缺檔的詞包本來就沒載入，拿掉它幫不上忙，不試），第一個成功的留下，其餘詞包照開，記一行含回傳碼與留下遮罩的日誌；
 4. 沒有任何一個少一個的組合成功（兩個以上的檔壞了）：建不帶詞包的引擎。
 
-偏好值不動，也不顯示錯誤，下一次重建會再試。驗證：`ShellTests` 的 `testCorruptPackFallsBackToAnEngineWithoutIt`、`testWithBothPacksOnABrokenFileKeepsTheOtherPack`、`testBrokenQuotesFileKeepsAcgAndIt`（引擎建置次數 4）、`testBrokenItPackDropsBothPacksFromTheMenuLine`、`testBrokenNonPackFileStopsAfterTwoBuilds`、`testOnlyPackBrokenKeepsTheProbeEngine`（只開一個詞包，引擎建置次數 2）、`testOnePresentPackBrokenWithAnotherFileMissingKeepsTheProbeEngine`（開兩個、一個缺檔，建置次數 2）、`testBrokenBeautyFileKeepsAcgAndIt`（引擎建置次數 5）、`testBrokenMemeFileKeepsTheOtherPacks`（引擎建置次數 6：合併、不帶詞包、少動漫、少資訊、少美妝、少迷因）、`testPackLineNamesTheBeautyPackInSettingsOrder`、`testPackLineNamesTheMemePackLast`、`testPackLineNamesTheQuotePackAfterAcg`、`testPackLineNamesTheLoadedPacks`、`testAcgPackMenuItemTogglesStoresAndSurvivesRestart`、`testItPackMenuItemTogglesStoresAndSurvivesRestart`、`testAcgDataDateLineComesFromTheManifest`；`SettingsTests` 的 `testBeautyPackSwitchFromTheWindowReachesStoreMaskAndTypedResult`、`testMemePackSwitchFromTheWindowReachesStoreMaskAndTypedResult`。
+偏好值不動，也不顯示錯誤，下一次重建會再試。背景建置換上的引擎若載入的詞包比要求的少（缺檔或壞檔），仍照樣換上，之後不會因為「載入的和要求的不同」而一直重建（殼比的是要求的遮罩與排列）。驗證：`ShellTests` 的 `testCorruptPackFallsBackToAnEngineWithoutIt`、`testWithBothPacksOnABrokenFileKeepsTheOtherPack`、`testBrokenQuotesFileKeepsAcgAndIt`（引擎建置次數 4）、`testBrokenItPackDropsBothPacksFromTheMenuLine`、`testBrokenNonPackFileStopsAfterTwoBuilds`、`testOnlyPackBrokenKeepsTheProbeEngine`（只開一個詞包，引擎建置次數 2）、`testOnePresentPackBrokenWithAnotherFileMissingKeepsTheProbeEngine`（開兩個、一個缺檔，建置次數 2）、`testBrokenBeautyFileKeepsAcgAndIt`（引擎建置次數 5）、`testBrokenMemeFileKeepsTheOtherPacks`（引擎建置次數 6：合併、不帶詞包、少動漫、少資訊、少美妝、少迷因）、`testPackLineNamesTheBeautyPackInSettingsOrder`、`testPackLineNamesTheMemePackLast`、`testPackLineNamesTheQuotePackAfterAcg`、`testPackLineNamesTheLoadedPacks`、`testAcgPackMenuItemTogglesStoresAndSurvivesRestart`、`testItPackMenuItemTogglesStoresAndSurvivesRestart`、`testAcgDataDateLineComesFromTheManifest`；`PackSwitchTests` 的 `testBrokenPackIsDroppedInTheBackgroundAndSwapped`（同樣壞迷因檔，經切換、引擎建置次數 6、載入遮罩 21）、`testMissingPackFileSwapsWithOneBuild`（缺檔建置 1 次）、`testFailureKeepsTheCurrentEngine`、`testLateFailureOfTheSharedPathKeepsTheCurrentEngine`（沒有結果、留在現行引擎、建置多 2 次）；`SettingsTests` 的 `testBeautyPackSwitchFromTheWindowReachesStoreMaskAndTypedResult`、`testMemePackSwitchFromTheWindowReachesStoreMaskAndTypedResult`。
 
 ### 4.4 打包與自測
 
@@ -575,4 +586,4 @@
 - 經典台詞詞包的衝突偵測只在動漫與資訊詞包都開的組合下做；只開台詞時，被另外兩包的詞蓋過的基底詞，可能被台詞分句擠掉而建置看不到（分句 2–10 字且與基底詞同讀音的少，未量）。
 - 資訊詞包的頻率門檻 50 與加分 3 是在探索格點上選的；詞包的詞只在模型沒看過時才拿到完整加分。
 - 讀音工具對破音字只能猜，名單層、資訊詞包與動漫詞包的 `CHECK` 讀音靠人工核對檔（`names-readings.tsv`、`it-readings.tsv`、`reading_overrides.tsv`）修正；沒進這些檔的 `CHECK` 讀音會照工具的暫定值收進詞包。
-- 疊加層的來源 dump、簡編本、OpenCC 表、萌典與小麥破音字表都不進 repo，需要時從環境變數（`SHANJIE_CACHE`、`SHANJIE_CONCISED`、`SHANJIE_MOEDICT`、`SHANJIE_HETERO`、`SHANJIE_UNIHAN`）找；沒設時對應的測試跳過並印 NOTE，跳過不等於通過。
+- 疊加層的來源 dump、簡編本、《重編國語辭典修訂本》的試算表（`tools/colloq_words.py` 用，`docs/spec/decoder.md` §8.7）、OpenCC 表、萌典與小麥破音字表都不進 repo，需要時從環境變數（`SHANJIE_CACHE`、`SHANJIE_CONCISED`、`SHANJIE_REVISED`、`SHANJIE_MOEDICT`、`SHANJIE_HETERO`、`SHANJIE_UNIHAN`）找；沒設時對應的測試跳過並印 NOTE，跳過不等於通過。

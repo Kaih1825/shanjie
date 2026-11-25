@@ -50,7 +50,9 @@ import readings  # noqa: E402  萌典路徑
 
 BASE = os.path.join(ROOT, "data", "lexicon", "mcbpmf-data.txt")
 OUT = os.path.join(ROOT, "data", "lexicon", "overlay-add.tsv")
+DROP = os.path.join(ROOT, "data", "lexicon", "overlay-drop.tsv")   # docs/spec/lexicon-and-packs.md §2.3：審過的錯字寫法（詞、基底的正確寫法、備註），產生的列裡不寫
 MANUAL = os.path.join(ROOT, "data", "lexicon", "overlay-manual.tsv")   # 手動加的詞，接在產生的列後面（來源 manual）
+SANDHI_ADD = os.path.join(ROOT, "data", "lexicon", "sandhi-add.tsv")   # 手動詞補基底詞的讀音時，產生的（讀音, 詞）不能和它的任何一列相同
 SLANG = os.path.join(ROOT, "data", "lexicon", "slang-add.tsv")   # 網路用語（docs/spec/lexicon-and-packs.md §2.10），接在手動詞後面（來源 slang）；沒有這個檔時輸出和以前相同
 PACKS = os.path.join(ROOT, "data", "packs")
 NAMES = os.path.join(ROOT, "data", "lexicon", "names-add.tsv")
@@ -58,7 +60,6 @@ SUPPLEMENT_SRC = "萌典補詞"
 SUPPLEMENT_MIN = 2   # docs/spec/lexicon-and-packs.md §2.7：語料裡子字串出現的次數下限
 PACK = os.path.join(ROOT, "data", "packs", "acg-add.tsv")   # 手動詞也不能是詞包的詞：引擎把詞包接在疊加層後面，同詞同讀音重複就整個載入失敗
 IT_PACK = os.path.join(ROOT, "data", "packs", "it-add.tsv")
-MEME_PACK = os.path.join(ROOT, "data", "packs", "meme-add.tsv")   # 迷因詞包（#293）；沒有這個檔時是空集合
 # 手動詞的分數＝同字數的 length_scores ＋ 這個值（log10）。量過：書面設定下「米雅歌」輸給「米亞哥」0.25（加 0.25 仍輸，
 # 加 0.5 時四個名字（五列）單獨打與放在句子裡，兩種設定 9 句都是第一名）。手動加的是明確指定的詞，所以比一般疊加層詞高一點。
 # docs/spec/lexicon-and-packs.md §2.9 規則 2：0.5 是 model-v5 上剛好過關的最小值；開 KN 的 model-v6 書面「米雅歌唱得很好」輸，改 0.75。
@@ -301,9 +302,15 @@ def build(moedict_readings=False, reading_report=None, supplement=None, jobs=1, 
     if lexgap:
         rows += lexgap_rows(lexgap, words | {r.split("\t")[1] for r in rows} | other_layers(), length_scores(base), syllables, base.by_reading, fold_w,
                             [r.split("\t")[:2] for r in rows])
+    phrase = conv[0] if conv else {}
+    rows, gone = prune(rows, lambda w: phrase_twin(w, phrase, words, moe))   # 整詞的簡體寫法（每個字台灣也用，S2n 的句子判斷看不到）
+    removed += gone
+    rows, gone = prune(rows, drop_list(words).get)   # 審過的錯字寫法
+    variant_removed += gone
     overlay_words = {r.split("\t")[1] for r in rows}
     assert not overlay_words & words                # 疊加層和基底的詞表交集必須是 0（手動詞由 manual_rows 自己檢查）
-    rows += tail_rows(words | overlay_words, length_scores(base), syllables)
+    rows += colloq_rows(rows)
+    rows += tail_rows(words | overlay_words, length_scores(base), syllables, fixed=fixed_pairs(base))
     if pick:
         print(f"--moedict-readings: {len(kept_old)} words keep their reading because readings.py marks them CHECK or GAP"
               + (f" (listed in {reading_report})" if reading_report else " (give --reading-report to list them)"))
@@ -319,19 +326,102 @@ def build(moedict_readings=False, reading_report=None, supplement=None, jobs=1, 
 
 
 
-def rebuild_tails(out=OUT):
+def phrase_twin(w, phrase, words, headwords):
+    """docs/spec/lexicon-and-packs.md §2.3：w 整個詞是簡繁詞組表（STPhrases 加 tw-conv.tsv 選定的值）的鍵、值是另一個寫法、那個寫法在基底，而且 w 不是
+    萌典詞目 → 回那個寫法，否則 None。is_simplified 只看字（S 與標記字），「松散」「取舍」「船只」每個字台灣也用，句子判成繁體，表裡的 松散→鬆散 就沒人查。
+    只查整詞的鍵：最長比對會把 花卷市 改成 花捲市。目標要在基底（人工整理過的詞庫），目標只在疊加層的不動。"""
+    w2 = phrase.get(w)
+    return w2 if w2 and w2 != w and w2 in words and w not in headwords else None
+
+
+def drop_list(words, path=DROP):
+    """overlay-drop.tsv → {錯字寫法: 基底的正確寫法}。每列三欄（詞、正確寫法、備註；# 與空行略過）；詞不在基底、正確寫法在基底、同一個詞只能一列，不符就中止並指出行號。
+    沒有這個檔是空表。錯字寫法沒有表可查（好高鶩遠 的 鶩 與 騖 不是異體字），所以是審過的清單，不是規則。"""
+    out = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8-sig") as f:
+        for n, line in enumerate(f.read().splitlines(), 1):
+            if line.startswith("#") or not line.strip():
+                continue
+            p = line.split("\t")
+            if len(p) != 3 or p[0] in words or p[1] not in words or p[0] in out:
+                raise SystemExit(f"{path}:{n}: bad drop row")
+            out[p[0]] = p[1]
+    return out
+
+
+def prune(rows, twin):
+    """rows 裡 twin(詞) 有回值的列都拿掉（一個詞的每一列，含變調列）。回 (留下的列, 被拿掉的紀錄「詞、落點、讀音」)。"""
+    kept, gone = [], []
+    for r in rows:
+        key, w = r.split("\t")[:2]
+        to = twin(w)
+        if to:
+            gone.append(f"{w}\t{to}\t{key}\n")
+        else:
+            kept.append(r)
+    return kept, gone
+
+
+def rebuild_tails(out=OUT, refilter=False):
     """overlay-add.tsv 產生的列（標籤不是 manual、slang）照舊，檔尾照 tail_rows 重算；給只改了手動詞或網路用語的時候用，不必有 dump。"""
     with open(out, encoding="utf-8") as f:
-        kept = [l for l in f if l.rstrip("\n").split("\t")[3] not in ("manual", "slang")]
+        kept = [l for l in f if l.rstrip("\n").split("\t")[3] not in ("manual", "slang", "colloq")]
     base = ime.Lexicon(BASE)
-    return kept + tail_rows(set(base.by_word) | {l.split("\t")[1] for l in kept}, length_scores(base), base_syllables(base))
+    words = set(base.by_word)
+    kept, _ = prune(kept, drop_list(words).get)     # 清單是 repo 裡的檔，不必有 dump：改了清單用 --tails-only 就生效
+    if refilter:                                    # --refilter：完整建置才有的整詞簡體規則也套到留著的列（要 OpenCC 表與萌典，缺了就中止）
+        phrase, moe = bc.load_conv()[0], moe_titles()
+        kept, gone = prune(kept, lambda w: phrase_twin(w, phrase, words, moe))
+        print(f"--refilter: {len(gone)} rows of {len({g.split(chr(9))[0] for g in gone})} words are whole-word Simplified forms of a base word")
+    return kept + colloq_rows(kept) + tail_rows(words | {l.split("\t")[1] for l in kept}, length_scores(base), base_syllables(base), fixed=fixed_pairs(base))
 
 
-def tail_rows(taken, scores, syllables, manual=MANUAL, slang=SLANG):
-    """overlay-add.tsv 的檔尾：手動詞（manual），再接網路用語（slang，檔案存在才有）。網路用語也不能是名單層、兩個詞包或手動詞的詞。"""
-    meme = pack_words(MEME_PACK) if os.path.exists(MEME_PACK) else set()
-    taken = taken | pack_words() | pack_words(IT_PACK) | meme | names_words()   # 同詞同讀音和詞包、名單層重複，引擎整個載入失敗
-    rows = manual_rows(taken, scores, syllables, manual)
+def colloq_rows(rows, table=None, penalty=None):
+    """口語變調的疊字陰平化（docs/spec/decoder.md §8.7）：rows（產生的列）裡 tools/colloq-words.tsv 有的詞，每一列照 build_sandhi.colloq_variant 改讀音，
+    分數 − COLLOQ_PENALTY，標籤 colloq，接在產生的列後面、手動列前面；已存在的（讀音, 詞）不寫，同一個新讀音取分數高的。"""
+    table = build_sandhi.colloq_table() if table is None else table
+    penalty = build_sandhi.COLLOQ_PENALTY if penalty is None else penalty
+    existing = {tuple(r.split("\t")[:2]) for r in rows}
+    best = {}
+    for r in rows:
+        reading, w, score, _ = r.rstrip("\n").split("\t")
+        new = build_sandhi.colloq_variant(reading.split("-"), table[w]) if w in table else None
+        key = ("-".join(new), w) if new else None
+        if key and key not in existing and (key not in best or float(score) - penalty > best[key]):
+            best[key] = float(score) - penalty
+    return [f"{k[0]}\t{k[1]}\t{round(sc, 8)!r}\tcolloq\n" for k, sc in best.items()]
+
+
+def fixed_pairs(base, sandhi=SANDHI_ADD):
+    """基底與 sandhi-add.tsv 的（讀音, 詞）→ 分數：手動詞補基底詞的讀音時，產生的每一對都不能在這裡（docs/spec/lexicon-and-packs.md §2.9），
+    補的讀音的分數不低於這個詞在這裡的最高分（tail_rows 的 refill）。
+    sandhi-add.tsv 接在 overlay-add.tsv 後面當同一份疊加層文字，同一對出現在兩個檔的一般列，引擎載入失敗；colloq 列不查重複，
+    但 build_sandhi.py 重產時會拿掉 sandhi-add.tsv 的那一列。"""
+    pairs = {}
+    for syls, entries in base.by_reading.items():
+        for w, sc in entries:
+            k = ("-".join(syls), w)
+            pairs[k] = max(sc, pairs.get(k, sc))
+    with open(sandhi, encoding="utf-8") as f:
+        for l in f:
+            p = l.rstrip("\n").split("\t")
+            if len(p) >= 3:
+                pairs[(p[0], p[1])] = max(float(p[2]), pairs.get((p[0], p[1]), float(p[2])))
+    return pairs
+
+
+def tail_rows(taken, scores, syllables, manual=MANUAL, slang=SLANG, fixed=None):
+    """overlay-add.tsv 的檔尾：手動詞（manual），再接網路用語（slang，檔案存在才有）。網路用語也不能是名單層、任何 *-add.tsv 詞包或手動詞的詞。
+    fixed＝fixed_pairs(base)：手動詞可以是基底詞（補讀音），只要它不在詞包、名單層，產生的（讀音, 詞）也都不在 fixed；空集合時手動詞照舊不能是基底詞。"""
+    layers = other_layers()   # 名單層與每一個 *-add.tsv 詞包：同詞同讀音和它們重複，引擎整個載入失敗
+    taken = taken | layers
+    fixed, refill = fixed or {}, {}
+    for (_, w), sc in fixed.items():
+        if w not in layers:
+            refill[w] = max(sc, refill.get(w, sc))
+    rows = manual_rows(taken, scores, syllables, manual, refill=refill, fixed=fixed)
     if os.path.exists(slang):
         rows += slang_behind(manual_rows(taken | {r.split("\t")[1] for r in rows}, scores, syllables, slang, "slang"), boosted_words(slang))
     return rows
@@ -696,11 +786,14 @@ def names_words(path=NAMES):
         return {l.split("\t")[1] for l in f if "\t" in l}
 
 
-def manual_rows(taken, scores, syllables, path=MANUAL, tag="manual"):
+def manual_rows(taken, scores, syllables, path=MANUAL, tag="manual", refill=None, fixed=frozenset()):
     """overlay-manual.tsv 的列（詞、讀音、備註；# 開頭與空行略過），照檔案順序。每列都要：三欄（網路用語可以有第四欄，見最後）；詞是純漢字、字數在 scores 裡（2 字以上）、
     不在 taken（基底、疊加層、詞包）；讀音的音節數等於字數，每個音節都是基底有的音節。產生的列（含 overlay_rows 自動加的變調列）
     同一個（讀音, 詞）不能出現兩次。不符就中止並指出行號。分數＝scores[字數]＋MANUAL_BONUS＋可選的第四欄「加分」（只有網路用語，tag="slang"；
-    0.5 的倍數、0 < 加分 ≤ BOOST_MAX；網路用語輸給沒人這樣講的組合時加分，見 docs/spec/lexicon-and-packs.md §2.10）。"""
+    0.5 的倍數、0 < 加分 ≤ BOOST_MAX；網路用語輸給沒人這樣講的組合時加分，見 docs/spec/lexicon-and-packs.md §2.10）。
+    refill（詞 → 它在基底與 sandhi-add.tsv 的最高分）裡的詞（基底詞，不在詞包與名單層）在 taken 裡也收，但產生的每一個（讀音, 詞）都不能在
+    fixed（基底與 sandhi-add.tsv）：這種列是補讀音（§2.9），分數取上面的分數與那個最高分的較大者（同一個詞換一個讀音，常用的程度不變）。"""
+    refill = refill or {}
     rows, seen = [], set()
     with open(path, encoding="utf-8-sig") as f:
         lines = f.read().splitlines()
@@ -719,11 +812,16 @@ def manual_rows(taken, scores, syllables, path=MANUAL, tag="manual"):
         if ok:
             w, reading = fields[:2]
             syls = reading.split(" ")
-            ok = bool(MANUAL_WORD.match(w)) and len(w) in scores and len(syls) == len(w) and all(s in syllables for s in syls) and w not in taken
+            ok = bool(MANUAL_WORD.match(w)) and len(w) in scores and len(syls) == len(w) and all(s in syllables for s in syls) and (w not in taken or w in refill)
         if not ok:
             raise SystemExit(f"{path}:{n}: bad manual row")
-        for r in overlay_rows(w, syls, round(scores[len(w)] + MANUAL_BONUS + boost, 8), tag):
+        score = scores[len(w)] + MANUAL_BONUS + boost
+        if w in refill:
+            score = max(score, refill[w])
+        for r in overlay_rows(w, syls, round(score, 8), tag):
             key = tuple(r.split("\t")[:2])
+            if key in fixed:
+                raise SystemExit(f"{path}:{n}: {w!r} already has the reading {key[0]} in the base lexicon or sandhi-add.tsv (sandhi rows count)")
             if key in seen:
                 raise SystemExit(f"{path}:{n}: {w!r} repeats a reading already listed (sandhi rows count)")
             seen.add(key)
@@ -774,6 +872,7 @@ def main():
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--tails-only", action="store_true", help="不讀 dump：保留 overlay-add.tsv 產生的列，只重算檔尾的手動詞與網路用語")
+    ap.add_argument("--refilter", action="store_true", help="（搭配 --tails-only）留著的列也套整詞簡體規則；要 OpenCC 表與 SHANJIE_MOEDICT")
     ap.add_argument("--moedict-readings", action="store_true")
     ap.add_argument("--reading-report", metavar="PATH")
     ap.add_argument("--moedict-supplement", nargs="+", metavar="FILE")
@@ -786,8 +885,10 @@ def main():
         ap.error("--lexgap needs a file")
     if a.lexgap and a.tails_only:
         ap.error("--lexgap needs a full build, not --tails-only")
+    if a.refilter and not a.tails_only:
+        ap.error("--refilter needs --tails-only (a full build applies the rule itself)")
     if a.tails_only:
-        rows = rebuild_tails()
+        rows = rebuild_tails(refilter=a.refilter)
         with open(OUT + ".tmp", "w", encoding="utf-8") as f:
             f.writelines(rows)
         os.replace(OUT + ".tmp", OUT)

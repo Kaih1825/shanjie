@@ -27,7 +27,7 @@
 //! store needs its own ACL and reparse-point design and a security review (a later slice).
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
-use crate::learn::{context_key, is_han, is_single, single_key_ok, FINE_SEP, Record, GLOBAL, NEWWORD, NEWWORD_MAX, NEWWORD_MIN, NEXT_PREFIX, SENTINEL};
+use crate::learn::{context_key, is_han, is_single, single_key_ok, EN_PREFIX, FINE_SEP, Record, GLOBAL, NEWWORD, NEWWORD_MAX, NEWWORD_MIN, NEXT_PREFIX, SENTINEL};
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{ErrorKind, Read, Write};
@@ -61,16 +61,20 @@ const ELOOP: i32 = 62;
 const F_FULLFSYNC: i32 = 51;
 #[cfg(target_os = "macos")]
 const F_BARRIERFSYNC: i32 = 85;
-// Linux (x86_64) values, only so the test suite can run off the Mac (the Windows box's WSL); nothing
-// ships for Linux. The same symlink and FIFO tests check them there.
+// Linux values, only so the test suite and the evaluation tools run off the Mac (the Windows box's WSL, x86_64 and Graviton cloud
+// machines); nothing ships for Linux. The same symlink and FIFO tests check them there. O_NOFOLLOW is per architecture: x86_64 takes
+// the generic <asm-generic/fcntl.h> value, arm64 overrides it in <asm/fcntl.h> (O_DIRECTORY 040000, O_NOFOLLOW 0100000);
+// O_NONBLOCK and ELOOP are the generic values on both.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_NOFOLLOW: i32 = 0o100000;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const O_NONBLOCK: i32 = 0o4000;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 const ELOOP: i32 = 40;
-#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
-compile_error!("learn_store.rs has <fcntl.h> values only for macOS and x86_64 Linux (O_NOFOLLOW differs by architecture)");
+#[cfg(all(target_os = "linux", not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+compile_error!("learn_store.rs has <fcntl.h> values only for macOS, x86_64 Linux and aarch64 Linux (O_NOFOLLOW differs by architecture)");
 
 #[cfg(unix)]
 extern "C" {
@@ -159,6 +163,17 @@ fn legal_context(r: &Record) -> bool {
     if c == NEWWORD {
         let n = r.word.chars().count();
         return (NEWWORD_MIN..=NEWWORD_MAX).contains(&n) && r.word.chars().all(is_han) && r.reading.len() == n;
+    }
+    // docs/spec/learning.md §4.4: `^en:` plus the English part of a mixed word in lower case (`[a-z][a-z0-9]{0,15}`); the word is that English
+    // part in any case and then one Han character per syllable, and no syllable is a token's reading.
+    if let Some(en) = c.strip_prefix(EN_PREFIX) {
+        let e = en.as_bytes();
+        let english = (1..=16).contains(&e.len()) && e[0].is_ascii_lowercase() && e.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        return english
+            && r.word.get(..en.len()).is_some_and(|head| head.eq_ignore_ascii_case(en))
+            && r.word[en.len()..].chars().count() == r.reading.len()
+            && r.word[en.len()..].chars().all(is_han)
+            && r.reading.iter().all(|s| !s.starts_with(crate::learn::PUNCT_PREFIX));
     }
     if let Some(next) = c.strip_prefix(NEXT_PREFIX) {
         // A mid or fine key (docs/spec/learning.md §7.1): a single character only, and exactly the well-formed shape (`single_key_ok`); it holds a control character, so `clean` would refuse it.

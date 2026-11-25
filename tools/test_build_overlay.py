@@ -14,12 +14,76 @@ SCORES = {2: -7.0, 3: -7.04116568, 4: -6.6, 5: -6.17843815}
 SYLLABLES = {"ㄐㄧㄚˇ", "ㄧˇ", "ㄅㄧㄥˇ", "ㄉㄧㄥ", "ㄨˋ", "ㄧ", "ㄧˋ", "ㄒㄧㄡ", "ㄍㄜ"}
 
 
-def manual(text, taken=frozenset(), encoding="utf-8", tag="manual"):
+def manual(text, taken=frozenset(), encoding="utf-8", tag="manual", refill=None, fixed=frozenset()):
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "m.tsv")
         with open(p, "w", encoding=encoding) as f:
             f.write(text)
-        return B.manual_rows(set(taken), SCORES, SYLLABLES, p, tag)
+        return B.manual_rows(set(taken), SCORES, SYLLABLES, p, tag, refill=refill, fixed=fixed)
+
+
+class ManualRefill(unittest.TestCase):
+    """docs/spec/lexicon-and-packs.md §2.9: a manual row may name a base word (refill) only with readings that neither the base nor
+    sandhi-add.tsv has, the sandhi row overlay_rows adds included; slang rows never take a base word."""
+    BASE = {("ㄐㄧㄚˇ-ㄧˇ", "甲乙"): -9.0}   # a base score under the manual score, so the manual score stands
+
+    def test_a_base_word_takes_a_reading_the_base_lacks(self):
+        self.assertEqual(manual("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n", taken={"甲乙"}, refill={"甲乙": -9.0}, fixed=self.BASE),
+                         [f"ㄐㄧㄚˇ-ㄧˋ\t甲乙\t{round(SCORES[2] + B.MANUAL_BONUS, 8)!r}\tmanual\n"])
+
+    def test_a_refill_takes_the_base_score_when_it_is_higher(self):
+        # the same word under another reading: as common as under the base reading, so the manual score does not pull it down
+        self.assertEqual(manual("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n", taken={"甲乙"}, refill={"甲乙": -5.0}, fixed=self.BASE),
+                         ["ㄐㄧㄚˇ-ㄧˋ\t甲乙\t-5.0\tmanual\n"])
+        with tempfile.TemporaryDirectory() as d:
+            m = os.path.join(d, "m.tsv")
+            with open(m, "w", encoding="utf-8") as f:
+                f.write("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n")
+            high = {("ㄐㄧㄚˇ-ㄧˇ", "甲乙"): -5.5, ("ㄐㄧㄚˇ-ㄧˇ-x", "甲乙"): -5.0}   # the word's highest score over its rows
+            self.assertEqual(B.tail_rows({"甲乙"}, SCORES, SYLLABLES, manual=m, slang=os.path.join(d, "absent.tsv"), fixed=high),
+                             ["ㄐㄧㄚˇ-ㄧˋ\t甲乙\t-5.0\tmanual\n"])
+
+    def test_a_reading_the_base_has_stops_the_build_with_the_line(self):
+        with self.assertRaisesRegex(SystemExit, r"m\.tsv:2: '甲乙' already has the reading ㄐㄧㄚˇ-ㄧˇ"):
+            manual("# c\n甲乙\tㄐㄧㄚˇ ㄧˇ\tx\n", taken={"甲乙"}, refill={"甲乙": -9.0}, fixed=self.BASE)
+
+    def test_a_pair_in_sandhi_add_stops_the_build_main_row_or_sandhi_row(self):
+        # 一 before a first tone gets the sandhi row ㄧˋ: either row colliding with sandhi-add.tsv stops the build
+        for pair in (("ㄧ-ㄒㄧㄡ-ㄍㄜ", "一休哥"), ("ㄧˋ-ㄒㄧㄡ-ㄍㄜ", "一休哥")):
+            with self.assertRaisesRegex(SystemExit, r"m\.tsv:1: .*sandhi-add\.tsv", msg=pair[0]):
+                manual("一休哥\tㄧ ㄒㄧㄡ ㄍㄜ\tx\n", taken={"一休哥"}, refill={"一休哥": -9.0}, fixed={("ㄐㄧㄚˇ-ㄧˇ", "一休哥"), pair})
+
+    def test_a_word_outside_refill_still_stops_the_build(self):
+        with self.assertRaises(SystemExit):     # in a pack, a name layer or the overlay: taken but not refill
+            manual("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n", taken={"甲乙"}, fixed=self.BASE)
+
+    def test_slang_never_takes_a_base_word(self):
+        with tempfile.TemporaryDirectory() as d:
+            m, sl = os.path.join(d, "m.tsv"), os.path.join(d, "s.tsv")
+            with open(m, "w", encoding="utf-8") as f:
+                f.write("")
+            with open(sl, "w", encoding="utf-8") as f:
+                f.write("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n")
+            with self.assertRaisesRegex(SystemExit, r"s\.tsv:1: bad manual row"):
+                B.tail_rows({"甲乙"}, SCORES, SYLLABLES, manual=m, slang=sl, fixed=self.BASE)
+
+    def test_a_base_word_in_a_pack_or_the_names_layer_is_no_refill(self):
+        with tempfile.TemporaryDirectory() as d:
+            m, sl = os.path.join(d, "m.tsv"), os.path.join(d, "absent.tsv")
+            with open(m, "w", encoding="utf-8") as f:
+                f.write("甲乙\tㄐㄧㄚˇ ㄧˋ\tx\n")
+            with mock.patch.object(B, "other_layers", lambda: set()):
+                self.assertEqual(len(B.tail_rows({"甲乙"}, SCORES, SYLLABLES, manual=m, slang=sl, fixed=self.BASE)), 1)
+            with mock.patch.object(B, "other_layers", lambda: {"甲乙"}), self.assertRaisesRegex(SystemExit, r"m\.tsv:1: bad manual row"):
+                B.tail_rows({"甲乙"}, SCORES, SYLLABLES, manual=m, slang=sl, fixed=self.BASE)
+
+    def test_fixed_pairs_has_the_base_and_every_sandhi_add_row(self):
+        base = ime.Lexicon(B.BASE)
+        fixed = B.fixed_pairs(base)
+        with open(B.SANDHI_ADD, encoding="utf-8") as f:
+            sandhi = [tuple(l.split("\t")[:2]) for l in f]
+        self.assertTrue(sandhi and set(sandhi) <= fixed.keys())
+        self.assertIn(("ㄨㄟˊ-ㄕㄚˊ", "為啥"), fixed)
 
 
 class ManualRows(unittest.TestCase):
@@ -61,6 +125,25 @@ class ManualRows(unittest.TestCase):
         for why, (text, taken) in bad.items():
             with self.assertRaises(SystemExit, msg=why):
                 manual(text, taken)
+
+
+class ColloqRows(unittest.TestCase):
+    """docs/spec/decoder.md §8.7: the overlay's own rows of a listed word get a `colloq` row each (the rule and the penalty are tools/build_sandhi.py's)."""
+    TABLE = {"毛毛騰騰": [(2, "level"), (3, "level")]}
+
+    def test_a_row_per_reading_with_the_penalty_and_existing_ones_not_written(self):
+        rows = ["ㄇㄠˊ-ㄇㄠˊ-ㄊㄥˊ-ㄊㄥˊ\t毛毛騰騰\t-6.6\twikt\n", "ㄇㄠˊ-ㄇㄠˊ-ㄊㄥˇ-ㄊㄥˇ\t毛毛騰騰\t-7.1\twikt\n", "ㄅㄧㄥˇ-ㄉㄧㄥ\t丙丁\t-7.0\twikt\n"]
+        self.assertEqual(B.colloq_rows(rows, self.TABLE, 4.0), ["ㄇㄠˊ-ㄇㄠˊ-ㄊㄥ-ㄊㄥ\t毛毛騰騰\t-10.6\tcolloq\n"], "one new reading: the higher score")
+        self.assertEqual(B.colloq_rows(rows + ["ㄇㄠˊ-ㄇㄠˊ-ㄊㄥ-ㄊㄥ\t毛毛騰騰\t-9.0\twikt\n"], self.TABLE, 4.0), [])
+        self.assertEqual(B.colloq_rows(rows[2:], self.TABLE, 4.0), [])
+
+    def test_the_shipped_overlay_has_the_rows_before_its_manual_tail(self):
+        with open(B.OUT, encoding="utf-8") as f:
+            lines = f.readlines()
+        tags = [l.rstrip("\n").split("\t")[3] for l in lines]
+        at = [i for i, t in enumerate(tags) if t == "colloq"]
+        self.assertTrue(at and at == list(range(at[0], at[-1] + 1)) and all(t in ("manual", "slang") for t in tags[at[-1] + 1:]))
+        self.assertEqual([lines[i] for i in at], B.colloq_rows(lines[:at[0]]))
 
 
 class LexgapRows(unittest.TestCase):
@@ -710,15 +793,21 @@ class ShippedOverlay(unittest.TestCase):
         self.assertEqual(tags[tail:], sorted(tags[tail:], key=("manual", "slang").index), "manual rows, then slang rows, are the tail")
         base = ime.Lexicon(B.BASE)
         taken = set(base.by_word) | {l.split("\t")[1] for l in lines[:tail]}
-        self.assertEqual(lines[tail:], B.tail_rows(taken, B.length_scores(base), B.base_syllables(base)))
+        self.assertEqual(lines[tail:], B.tail_rows(taken, B.length_scores(base), B.base_syllables(base), fixed=B.fixed_pairs(base)))
         self.assertEqual(lines, B.rebuild_tails())
 
     def test_no_slang_file_leaves_the_manual_tail_alone(self):
         base = ime.Lexicon(B.BASE)
         args = (set(base.by_word), B.length_scores(base), B.base_syllables(base))
+        fixed = B.fixed_pairs(base)
         with tempfile.TemporaryDirectory() as d:
-            without = B.tail_rows(*args, slang=os.path.join(d, "absent.tsv"))
-        self.assertEqual(without, B.manual_rows(args[0] | B.pack_words() | B.pack_words(B.IT_PACK) | B.names_words(), *args[1:]))
+            without = B.tail_rows(*args, slang=os.path.join(d, "absent.tsv"), fixed=fixed)
+        layers = B.other_layers()
+        best = {}
+        for (_, w), sc in fixed.items():
+            if w not in layers:
+                best[w] = max(sc, best.get(w, sc))
+        self.assertEqual(without, B.manual_rows(args[0] | layers, *args[1:], refill=best, fixed=fixed))
         self.assertNotIn("slang", {r.rstrip("\n").split("\t")[3] for r in without})
 
 
@@ -727,6 +816,72 @@ class SlangBehind(unittest.TestCase):
         rows = ["a\t甲\t-5.0\tslang\n", "a\t乙\t-5.0\tslang\n", "b\t丙\t-5.0\tslang\n", "a\t丁\t-5.0\tslang\n"]
         got = [float(r.split("\t")[2]) for r in B.slang_behind(rows)]
         self.assertEqual(got, [-5.0, -5.0 - B.SLANG_BEHIND, -5.0, -5.0 - 2 * B.SLANG_BEHIND])
+
+
+class LateRemovals(unittest.TestCase):
+    """docs/spec/lexicon-and-packs.md §2.3: whole-word Simplified forms written with characters Taiwan also uses (松散), and the reviewed drop list
+    of typo forms (好高鶩遠). Neither was caught before: the sentence test only counts S and marker characters, and no table pairs 鶩 with 騖."""
+    def test_phrase_twin(self):
+        phrase = {"松散": "鬆散", "干涉": "干涉", "花卷": "花捲", "谷城": "穀城", "面條": "麵條"}
+        words, heads = {"鬆散", "干涉", "花捲", "麵條"}, {"面條"}
+        self.assertEqual(B.phrase_twin("松散", phrase, words, heads), "鬆散")
+        self.assertIsNone(B.phrase_twin("干涉", phrase, words, heads), "an identity entry is not a twin")
+        self.assertIsNone(B.phrase_twin("花卷市", phrase, words, heads), "only the whole word is looked up, never a part of it")
+        self.assertIsNone(B.phrase_twin("谷城", phrase, words, heads), "the target has to be a base word")
+        self.assertIsNone(B.phrase_twin("面條", phrase, words, heads), "a dictionary headword stays")
+        self.assertIsNone(B.phrase_twin("鬆散", phrase, words, heads))
+
+    def test_prune_takes_every_row_of_the_word_and_records_the_landing(self):
+        rows = ["ㄅㄨˋ-a\t甲\t-7.0\twikt\n", "ㄅㄨˊ-a\t甲\t-7.5\twikt\n", "b\t乙\t-7.0\twikt\n"]
+        kept, gone = B.prune(rows, {"甲": "丙"}.get)
+        self.assertEqual(kept, rows[2:])
+        self.assertEqual(gone, ["甲\t丙\tㄅㄨˋ-a\n", "甲\t丙\tㄅㄨˊ-a\n"])
+
+    def drops(self, text, words=frozenset({"好高騖遠"})):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "drop.tsv")
+            open(path, "w", encoding="utf-8").write(text)
+            return B.drop_list(set(words), path)
+
+    def test_drop_list_rows(self):
+        self.assertEqual(self.drops("# note\n\n好高鶩遠\t好高騖遠\t錯字\n"), {"好高鶩遠": "好高騖遠"})
+        self.assertEqual(B.drop_list(set(), os.path.join(tempfile.gettempdir(), "no-such-overlay-drop.tsv")), {}, "no file, no rows")
+        for bad in ("好高鶩遠\t好高騖遠\n",                      # two fields
+                    "好高鶩遠\t沒有這個詞\t錯字\n",               # the right form is not a base word
+                    "好高騖遠\t好高騖遠\t錯字\n",                 # the word itself is a base word
+                    "好高鶩遠\t好高騖遠\ta\n好高鶩遠\t好高騖遠\tb\n"):   # twice
+            with self.assertRaises(SystemExit, msg=bad):
+                self.drops(bad)
+
+    def test_a_full_build_applies_both(self):
+        b = BuildFlags("test_default_is_the_old_method"); BuildFlags.setUpClass()
+        target = next(w for w in b.base.by_word if len(w) == 2)
+        (rows, removed, variant_removed, _), _ = b.build()
+        self.assertTrue(b.row(rows, b.title) and b.row(rows, b.other))
+        with mock.patch.object(B, "phrase_twin", lambda w, *a: target if w == b.title else None), mock.patch.object(B, "drop_list", lambda words: {b.other: target}):
+            (rows, removed, variant_removed, _), _ = b.build()
+        self.assertEqual((b.row(rows, b.title), b.row(rows, b.other)), ([], []))
+        self.assertEqual([r.split("\t")[:2] for r in removed], [[b.title, target]])
+        self.assertEqual([r.split("\t")[:2] for r in variant_removed], [[b.other, target]])
+
+    def test_the_shipped_overlay_has_none_of_them(self):
+        """The committed file: no row of a drop-list word (so editing overlay-drop.tsv without `--tails-only` fails here and in ShippedOverlay), and,
+        where the OpenCC tables and the dictionary are on this machine (not in CI), no generated row that phrase_twin would remove."""
+        base = set(ime.Lexicon(B.BASE).by_word)
+        with open(B.OUT, encoding="utf-8") as f:
+            gen = {l.split("\t")[1] for l in f if l.rstrip("\n").split("\t")[3] not in ("manual", "slang")}
+        drop = B.drop_list(base)
+        self.assertIn("好高鶩遠", drop)
+        self.assertEqual(gen & (set(drop) | {"松散", "好高鶩遠"}), set())
+        moedict = os.environ.get("SHANJIE_MOEDICT")
+        if not (moedict and os.path.isfile(moedict) and os.path.isfile(os.path.join(bc.SRC, "opencc", "STPhrases.txt"))):
+            print("NOTE: no OpenCC tables or SHANJIE_MOEDICT here: the whole-word Simplified rule is not checked against the shipped overlay", file=sys.stderr)
+            return
+        with mock.patch.dict(os.environ, {"SHANJIE_TW_CLEAN": "off"}), contextlib.redirect_stderr(io.StringIO()):
+            phrase = bc.load_conv()[0]
+        heads = B.moe_titles()
+        self.assertEqual(sorted(w for w in gen if B.phrase_twin(w, phrase, base, heads)), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -253,16 +253,22 @@ public final class MemoryEnglishStore: EnglishStore {
 
 /// Where the 模糊輸入 flags are kept (docs/spec/decoder.md §6.1): bits 0-3 the four sound pairs, bit 4 the adjacent-key
 /// slips, as `shanjie_engine_set_fuzzy`; `nil` means never chosen, which is 0 (all off). Same arrangement as `PredictionStore`.
+/// The same store keeps the 變調與口語讀音 switch of the same settings section (docs/spec/decoder.md §6.6): `nil` means never chosen, which is on.
 @MainActor
 public protocol FuzzyStore: AnyObject {
     var fuzzyFlags: UInt32? { get set }
+    var tone3Sandhi: Bool? { get set }
 }
 
 /// The in-memory FuzzyStore.
 @MainActor
 public final class MemoryFuzzyStore: FuzzyStore {
     public var fuzzyFlags: UInt32?
-    public init(_ fuzzyFlags: UInt32? = nil) { self.fuzzyFlags = fuzzyFlags }
+    public var tone3Sandhi: Bool?
+    public init(_ fuzzyFlags: UInt32? = nil, tone3Sandhi: Bool? = nil) {
+        self.fuzzyFlags = fuzzyFlags
+        self.tone3Sandhi = tone3Sandhi
+    }
 }
 
 /// Where the "動漫與遊戲詞" switch is kept (docs/spec/lexicon-and-packs.md §4.1, §4.2): `nil` means never chosen, which is on. Same arrangement as `PredictionStore`.
@@ -427,19 +433,27 @@ private final class QueueRerankHandle: RerankHandle {
     init(_ waiter: RerankWaiter) { self.waiter = waiter }
 }
 
-/// The app's runner: one serial `.utility` queue with a fixed label. The closure holds the job wrapper (never its
+/// The app's runner: one serial `.userInitiated` queue with a fixed label (the user is waiting at the composition for the result:
+/// at `.utility`, with every core busy, a job's queueing plus compute grew from about 50 ms to over 2 s and none reached the screen,
+/// mac-rerank-latency 2026-11-23). The closure holds the job wrapper (never its
 /// pointer) until run returns. Two orderings put the run before the main-thread apply (RerankJob invariant 2): the code comes
 /// back through `DispatchQueue.main.async`, or the main thread is woken by this job's semaphore, which is signalled only after
 /// `run()` returned (Enter's bounded wait, `wait(_:until:)`, docs/spec/keys-and-composition.md §7.3). The main thread otherwise never waits for the queue.
 public final class QueueRerankRunner: RerankRunner {
-    private let queue = DispatchQueue(label: "com.nyanako.inputmethod.shanjie.rerank", qos: .utility)
+    private let queue = DispatchQueue(label: "com.nyanako.inputmethod.shanjie.rerank", qos: .userInitiated)
 
     public init() {}
 
     public func run(_ job: RerankJob, done: @escaping @MainActor @Sendable (Int32) -> Void) -> RerankHandle {
         let waiter = RerankWaiter()
         queue.async {
+#if SHANJIE_TIMING
+            Timing.shared.record(4, job.timingSeq)
+#endif
             let code = job.run()
+#if SHANJIE_TIMING
+            Timing.shared.record(5, job.timingSeq, UInt64(UInt32(bitPattern: code)))
+#endif
             waiter.code.withLock { $0 = code }  // before the signal
             waiter.signal.signal()
             DispatchQueue.main.async { done(code) }
@@ -621,6 +635,10 @@ public final class Shell {
     private(set) var fuzzyFlags: UInt32 = 0
     /// What `build()` sent to each engine it made, in order (test hook, like `rerankSent`).
     private(set) var fuzzySent: [UInt32] = []
+    /// docs/spec/decoder.md §6.6: the 變調與口語讀音 switch (default true: `UserDefaults` key `tone3Sandhi`, absent is true); sent to every engine `build()` makes.
+    private(set) var tone3On = true
+    /// What `build()` sent to each engine it made, in order (test hook, like `fuzzySent`).
+    private(set) var tone3Sent: [Bool] = []
     private let acgPackStore: AcgPackStore
     /// The ACG word pack (default on): parsed into the lexicon, so a change rebuilds the engine like a layout change.
     private(set) var acgPackOn = true
@@ -674,6 +692,56 @@ public final class Shell {
     var shiftTap = ShiftTap()
     /// docs/spec/macos-shell.md §13: the in-memory diagnostic log of the Shift toggle.
     public let diag: DiagLog
+    /// docs/spec/macos-shell.md §13.1 (`flags`): the system's running count of `flagsChanged` events in this login session
+    /// (`CGEventSource.counterForEventType`, no permission needed), passed by the app. The default 0 never moves, so a shell built
+    /// without it (every test but the `flags` ones) records no `flags` line.
+    let flagsCounter: () -> UInt32
+    /// How many `flagsChanged` events any session's `handle` was given, wrapping. Only ever compared with `flagsCounter` into the
+    /// three values of a `flags` line; never logged, printed or exported.
+    private(set) var flagsSeen: UInt32 = 0
+    /// One entry per session between its `activate` and its `deactivate`: the two counts at the activate, and whether secure input
+    /// was seen since (then no `flags` line). The differences are process-wide: overlapping intervals count the same events.
+    /// Emptied when the diagnostic log is (`DiagLog.onClear`) or is found off.
+    private var flagsIntervals: [FlagsInterval] = []
+    private struct FlagsInterval {
+        weak var session: Session?
+        let system: UInt32
+        let seen: UInt32
+        var void: Bool
+    }
+
+    /// Called first by every `Session.handle`.
+    func flagsHandle(_ event: NSEvent?) {
+        if event?.type == .flagsChanged { flagsSeen &+= 1 }
+        flagsObserve()
+    }
+
+    /// One observation point (any session's handle, activate, deactivate): the log off drops every interval; secure input voids every
+    /// open one. Asks `isSecureInput` only while an interval is open.
+    private func flagsObserve() {
+        guard !flagsIntervals.isEmpty else { return }
+        guard diag.enabled else { flagsIntervals = []; return }
+        if isSecureInput() { for i in flagsIntervals.indices { flagsIntervals[i].void = true } }
+    }
+
+    /// `session` was activated: its interval starts here unless it already has one (a second activate keeps the first start).
+    func flagsBegin(_ session: Session) {
+        flagsIntervals.removeAll { $0.session == nil }  // sessions released without a deactivate
+        if diag.enabled, !flagsIntervals.contains(where: { $0.session === session }) {
+            flagsIntervals.append(FlagsInterval(session: session, system: flagsCounter(), seen: flagsSeen, void: !shiftToggleOn))
+        }
+        flagsObserve()
+    }
+
+    /// `session` was deactivated: ends its interval, if it has one, and gives what to record: `nil` for no interval, a void one, the
+    /// log or the Shift toggle off, or a system count that did not move.
+    func flagsEnd(_ session: Session) -> DiagLog.Delivery? {
+        flagsObserve()
+        guard let i = flagsIntervals.firstIndex(where: { $0.session === session }) else { return nil }
+        let start = flagsIntervals.remove(at: i)
+        guard !start.void, shiftToggleOn else { return nil }
+        return DiagLog.delivery(system: flagsCounter() &- start.system, seen: flagsSeen &- start.seen)
+    }
     /// Seconds since the latest mouse-button press (left, right, other) in this login session; a test replaces it. No permission needed.
     var mouseAgo: () -> TimeInterval = {
         [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown]
@@ -737,12 +805,32 @@ public final class Shell {
     var rerankApply: (RerankJob, CoreEngine) -> CoreResult = { $0.apply(on: $1) }
     /// Every value `build()` passed to `setRerank`, in order (the tests read it: a nil store must send true, not nothing).
     private(set) var rerankSent: [Bool] = []
-    /// How many engines `build()` has tried to make (test hook, like `rerankSent`): the fall-back order is asserted by counting them.
+    /// How many engines the builds have tried to make (test hook, like `rerankSent`): the fall-back order is asserted by counting them.
     private(set) var engineBuilds = 0
-    private func makeEngine(packsDir: String?, packs: UInt32) -> (CoreEngine?, Int32) {
-        engineBuilds += 1
-        return CoreEngine.make(dataDir: resources.path, layout: mode.layout, packsDir: packsDir, packs: packs)
-    }
+    /// docs/spec/macos-shell.md §2.1, docs/spec/lexicon-and-packs.md §4.1: where a pack switch builds its engine, off the main thread. The app passes `QueuePackBuilder`, the tests
+    /// builders they complete by hand.
+    private let packBuilder: PackBuilder
+    /// A build is with the builder (at most one at a time).
+    private var buildInFlight = false
+    /// A finished build waiting for the composition to end (docs/spec/macos-shell.md §2.1); a switch or a layout change frees it.
+    private var ready: PackBuildResult?
+    /// Whether a finished build waits for the composition to end (test hook).
+    var hasReady: Bool { ready != nil }
+    /// What the current engine was asked for when it was built (the pack mask and the layout), not what it loaded: a pack whose file is missing or broken
+    /// makes the two differ, and the stale check and the decision to build again compare the asked-for values only. `nil` with no engine.
+    private var engineRequested: (mask: UInt32, layout: UInt32)?
+    /// Whether the current engine has the model, the small model and the colloquial table loaded: only then does a pack switch share them (`shanjie_engine_share`).
+    private var engineAllLoaded = false
+    /// Test hooks (like `rerankFree`): each engine's free and each shared-parts handle's free, and the core call that builds from the shared parts. Read when a build starts.
+    var engineFree: @Sendable (OpaquePointer) -> Void = { shanjie_engine_free($0) }
+    var sharedFree: @Sendable (OpaquePointer) -> Void = { shanjie_shared_free($0) }
+    var packBuildOps = PackBuildOps()
+    /// Engines made and freed so far, whichever thread did it; the tests assert that at most two live.
+    let engineCounter = EngineCounter()
+    /// For each finished build in order, whether it used the shared parts (test hook).
+    private(set) var packBuildShared: [Bool] = []
+    /// How long each swap took on the main thread, from its start to the new engine being the current one (nanoseconds; the benchmark and the tests read it).
+    private(set) var installNanos: [UInt64] = []
     /// Rerank strength (docs/spec/semantic-rerank.md §8.2): the stored level, sent to every engine `build()` makes and on every change.
     private(set) var rerankLevel: RerankLevel
     /// Every level code sent to an engine, by `build()` and by `setRerankLevel`, in order (the tests read it, as `rerankSent`).
@@ -768,8 +856,9 @@ public final class Shell {
     var englishOverwriteEnabled: Bool { englishEnabled && englishOn }
     /// The 依按鍵順序判斷英文 choice is greyed on the same condition as the overwrite choice.
     var englishKeyOrderEnabled: Bool { englishOverwriteEnabled }
-    /// The 快打時鍵序顛倒不當英文 choice only matters for trigger (b), which needs the key-order choice on: greyed unless that one is
-    /// enabled and on (the setting is kept).
+    /// The 快打時鍵序顛倒不當英文 choice is greyed unless the key-order choice is enabled and on (the setting is kept). Trigger (b) and the tone
+    /// moved up need the key-order choice on; the digit layer's reading of a hurried syllable (docs/spec/english-mixed.md §7.4) does not, and goes by
+    /// the kept setting while the choice is greyed.
     var englishReversalGuardEnabled: Bool { englishKeyOrderEnabled && englishKeyOrderOn }
 
     /// A job waiting for the runner, with the session and engine it was taken for. Weak: a waiting job keeps neither alive,
@@ -824,8 +913,10 @@ public final class Shell {
     /// The owning session. "Still valid" means this weak reference is not nil; an address
     /// (ObjectIdentifier) is never used, as a freed controller's address can be reused.
     weak var owner: Session?
-    /// Whether the composition (as last applied to a client) is non-empty.
-    var composing = false
+    /// Whether the composition (as last applied to a client) is non-empty. Its end lets a finished pack build take over (`scheduleInstall`).
+    var composing = false {
+        didSet { if !composing && oldValue { scheduleInstall() } }
+    }
     /// The last `lineRect` answer and the preedit and cursor it was asked for. Asking the client is a
     /// synchronous IPC on the key path, so a pure selection move (same preedit and cursor) reuses it.
     /// Cleared whenever the panel hides: commit, reset, owner change.
@@ -878,6 +969,8 @@ public final class Shell {
     /// `QueueRerankRunner`, the tests a runner they complete by hand.
     /// `profileModeStore`, `appProfileStore`: how chat or formal is chosen and the per-app choices (docs/spec/macos-shell.md §5.2).
     /// Required, like `glassTintStore`.
+    /// `packBuilder`: builds the engine of a pack switch off the main thread (docs/spec/macos-shell.md §2.1). The default builds on the calling thread, for the
+    /// rigs that do not test it; the app passes `QueuePackBuilder`, the pack tests builders they complete by hand.
     /// `fuzzyStore`: the 模糊輸入 flags (docs/spec/decoder.md §6.1). The default (in memory, all off) is for the tests; the app passes its
     /// UserDefaults-backed store.
     /// `punctuationTable`: Apple's punctuation candidate table (s3e); tests pass another path.
@@ -886,6 +979,7 @@ public final class Shell {
     /// `shiftToggleStore`, `shiftHint`: the 單按 Shift 切換中英 switch and its 英/中 hint window (docs/spec/keys-and-composition.md §9.1, §9.4). The defaults (in
     /// memory, no window) are for the tests; the app passes its own.
     /// `diagLogStore`: the 記錄偶發問題的診斷資料 switch (docs/spec/macos-shell.md §13); the default (in memory, on) is for the tests.
+    /// `flagsCounter`: the system's count of `flagsChanged` events (docs/spec/macos-shell.md §13.1); the default (always 0) is for the tests.
     /// `englishNoticeStore`, `englishNotice`: the one-time explanation window of the English defaults change and whether it is still owed
     /// (docs/spec/english-mixed.md §10.3). The defaults (in memory, not owed, no window) are for the tests; the app passes its own.
     /// `showsAbbreviation`: whether the abbreviation switch is offered. The default `true` is for the tests; the app passes `false`
@@ -896,6 +990,7 @@ public final class Shell {
                 glassTintStore: GlassTintStore, candidateOrientationStore: CandidateOrientationStore,
                 rerankStore: RerankStore, rerankRunner: RerankRunner,
                 profileModeStore: ProfileModeStore, appProfileStore: AppProfileStore,
+                packBuilder: PackBuilder = ImmediatePackBuilder(),
                 fuzzyStore: FuzzyStore = MemoryFuzzyStore(),
                 punctuationTable: URL = PunctuationTable.systemURL,
                 punctuationNames: URL = PunctuationNames.systemURL,
@@ -908,9 +1003,11 @@ public final class Shell {
                 shiftHint: ShiftHintPanel? = nil,
                 englishNoticeStore: EnglishNoticeStore = MemoryEnglishNoticeStore(),
                 englishNotice: EnglishNoticePanel? = nil,
-                diagLogStore: DiagLogStore = MemoryDiagLogStore()) {
+                diagLogStore: DiagLogStore = MemoryDiagLogStore(),
+                flagsCounter: @escaping () -> UInt32 = { 0 }) {
         self.resources = resources
         diag = DiagLog(store: diagLogStore)
+        self.flagsCounter = flagsCounter
         self.shiftToggleStore = shiftToggleStore
         shiftToggleOn = shiftToggleStore.shiftToggle ?? false // docs/spec/english-mixed.md §10.1: was true
         self.shiftHint = shiftHint
@@ -948,6 +1045,7 @@ public final class Shell {
         englishReversalGuardOn = englishStore.englishReversalGuard ?? true
         self.fuzzyStore = fuzzyStore
         fuzzyFlags = (fuzzyStore.fuzzyFlags ?? 0b1110000) & 0b1111111
+        tone3On = fuzzyStore.tone3Sandhi ?? true
         self.acgPackStore = acgPackStore
         acgDataDate = Shell.readAcgDataDate(resources.appendingPathComponent("packs/acg.json"))
         self.quotePackStore = quotePackStore
@@ -959,6 +1057,7 @@ public final class Shell {
         rerankOn = rerankStore.rerank ?? true
         rerankLevel = rerankStore.rerankLevel.flatMap(RerankLevel.init(rawValue:)) ?? .standard
         self.rerankRunner = rerankRunner
+        self.packBuilder = packBuilder
         self.profileModeStore = profileModeStore
         profileMode = profileModeStore.profileMode.flatMap(ProfileMode.init(rawValue:)) ?? .auto
         self.appProfileStore = appProfileStore
@@ -976,6 +1075,7 @@ public final class Shell {
         mode = layoutStore.layout.flatMap(InputMode.init(rawValue:)) ?? .standard
         build()
         panel.onSelect = { [weak self] i in self?.owner?.candidateSelected(at: i) }
+        diag.onClear = { [weak self] in self?.flagsIntervals = [] }
     }
 
     /// The current layout (the menu's checkmark).
@@ -1039,6 +1139,10 @@ public final class Shell {
 
     func applyFuzzy(_ flags: UInt32) {
         if let o = owner { o.applyFuzzy(flags) } else { dropOnFailure(setFuzzy(flags)) }
+    }
+
+    func applyTone3(_ on: Bool) {
+        if let o = owner { o.applyTone3(on) } else { dropOnFailure(setTone3(on)) }
     }
 
     func applyCandidateVertical(_ on: Bool) {
@@ -1181,6 +1285,15 @@ public final class Shell {
         return engine?.setFuzzy(fuzzyFlags)
     }
 
+    /// The settings window's 變調與口語讀音 switch (docs/spec/decoder.md §6.6): stored, and sent to the engine, which recomputes the composition (turned off, the
+    /// syllables it accepted are stored as their third tone); the snapshot is for the caller to show.
+    func setTone3(_ on: Bool) -> CoreResult? {
+        tone3On = on
+        fuzzyStore.tone3Sandhi = on
+        defer { changed() }
+        return engine?.setTone3(on)
+    }
+
     /// The settings window's 重打同一個位置算英文 choice (docs/spec/english-mixed.md §11): stored, and sent to the engine; the snapshot is for the
     /// caller to show (nothing on screen changes: an English run is text).
     func setEnglishOverwrite(_ on: Bool) -> CoreResult? {
@@ -1225,6 +1338,9 @@ public final class Shell {
     func setRerank(_ on: Bool) -> CoreResult? {
         rerankOn = on
         rerankStore.rerank = on
+#if SHANJIE_TIMING
+        if !on, let dropped = rerankPending { Timing.end(dropped.job.timingSeq, 5) }
+#endif
         if !on { rerankPending = nil }
         defer { changed() }
         return engine?.setRerank(on)
@@ -1245,6 +1361,9 @@ public final class Shell {
     func enqueueRerank(_ job: RerankJob, session: Session, engine: CoreEngine) {
         rerankTaken += 1
         let pending = PendingRerank(job: job, session: session, engine: engine)
+#if SHANJIE_TIMING
+        if rerankRunning != nil, let replaced = rerankPending { Timing.end(replaced.job.timingSeq, 3) }
+#endif
         if rerankRunning != nil { rerankPending = pending } else { startRerank(pending) }
     }
 
@@ -1272,9 +1391,19 @@ public final class Shell {
             }
         }
         guard code == 0 else {
+#if SHANJIE_TIMING
+            Timing.end(slot.job.timingSeq, 6)
+#endif
             Log.shell.error("shanjie_rerank_run failed, code \(code)")
             return
         }
+#if SHANJIE_TIMING
+        if !rerankOn {
+            Timing.end(slot.job.timingSeq, 5)
+        } else if slot.session.map({ $0 === owner }) != true || slot.engine.map({ $0 === self.engine }) != true {
+            Timing.end(slot.job.timingSeq, 4)
+        }
+#endif
         guard rerankOn, let session = slot.session, session === owner, let engine = slot.engine, engine === self.engine else { return }
         session.applyRerankJob(slot.job, on: engine)
     }
@@ -1289,33 +1418,42 @@ public final class Shell {
             rerankOn && composing && candidateSelected < 0
                 && (rerankRunning.map { mine($0.session, $0.engine) } ?? false || rerankPending.map { mine($0.session, $0.engine) } ?? false)
         }
+#if SHANJIE_TIMING
+        if !relevant() { Timing.enterWait(micros: 0, jobs: 0, timedOut: false) }
+#endif
         guard relevant() else { return }
         let deadline = DispatchTime.now() + .milliseconds(enterRerankWaitMS)
+#if SHANJIE_TIMING
+        let timingStart = Timing.now()
+        var timingJobs: UInt64 = 0
+        defer { Timing.enterWait(micros: Timing.now() - timingStart, jobs: timingJobs, timedOut: relevant()) }
+#endif
         while relevant(), let slot = rerankRunning, let handle = slot.handle, let code = rerankRunner.wait(handle, until: deadline) {
+#if SHANJIE_TIMING
+            timingJobs += 1
+#endif
             rerankFinished(slot, code: code)
         }
     }
 
-    /// The settings switch (docs/spec/lexicon-and-packs.md §4.2; it is not in the menu): the pack is part of the lexicon, so like a layout change the
-    /// composition is committed and the engine rebuilt; the choice is stored. Same value: nothing happens.
+    /// The settings switch (docs/spec/lexicon-and-packs.md §4.2; it is not in the menu): the pack is part of the lexicon, so the engine is built again, in the
+    /// background (`packsChanged`); the choice is stored at once, the composition is left alone and the new engine takes over when it ends. Same value: nothing happens.
     func setAcgPack(_ on: Bool) {
         guard on != acgPackOn else { return }
-        commitThenRebuild {
-            acgPackOn = on
-            acgPackStore.acgPack = on
-        }
+        acgPackOn = on
+        acgPackStore.acgPack = on
+        packsChanged()
         changed()
         Log.shell.debug("word pack switched")
     }
 
-    /// The 經典台詞 switch (docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2): like `setAcgPack`, the pack is part of the lexicon, so the composition
-    /// is committed and the engine rebuilt; the choice is stored. Same value: nothing happens.
+    /// The 經典台詞 switch (docs/spec/lexicon-and-packs.md §7.2, §4.1, §4.2): like `setAcgPack`, the pack is part of the lexicon, so the engine is
+    /// built again in the background and takes over when the composition ends; the choice is stored at once. Same value: nothing happens.
     func setQuotePack(_ on: Bool) {
         guard on != quotePackOn else { return }
-        commitThenRebuild {
-            quotePackOn = on
-            quotePackStore.quotePack = on
-        }
+        quotePackOn = on
+        quotePackStore.quotePack = on
+        packsChanged()
         changed()
         Log.shell.debug("quote pack switched")
     }
@@ -1323,10 +1461,9 @@ public final class Shell {
     /// The settings switch (docs/spec/lexicon-and-packs.md §4.2, §4.3): the same as `setAcgPack` for the IT+AI pack.
     func setItPack(_ on: Bool) {
         guard on != itPackOn else { return }
-        commitThenRebuild {
-            itPackOn = on
-            itPackStore.itPack = on
-        }
+        itPackOn = on
+        itPackStore.itPack = on
+        packsChanged()
         changed()
         Log.shell.debug("it pack switched")
     }
@@ -1334,10 +1471,9 @@ public final class Shell {
     /// The settings switch (docs/spec/lexicon-and-packs.md §4.2, §8.3): the same as `setItPack` for the beauty and skincare pack.
     func setBeautyPack(_ on: Bool) {
         guard on != beautyPackOn else { return }
-        commitThenRebuild {
-            beautyPackOn = on
-            beautyPackStore.beautyPack = on
-        }
+        beautyPackOn = on
+        beautyPackStore.beautyPack = on
+        packsChanged()
         changed()
         Log.shell.debug("beauty pack switched")
     }
@@ -1345,10 +1481,9 @@ public final class Shell {
     /// The settings switch (docs/spec/lexicon-and-packs.md §4.2, §9.3): the same as `setBeautyPack` for the meme and livestream slang pack.
     func setMemePack(_ on: Bool) {
         guard on != memePackOn else { return }
-        commitThenRebuild {
-            memePackOn = on
-            memePackStore.memePack = on
-        }
+        memePackOn = on
+        memePackStore.memePack = on
+        packsChanged()
         changed()
         Log.shell.debug("meme pack switched")
     }
@@ -1373,79 +1508,57 @@ public final class Shell {
         changed()
     }
 
-    /// Creates the engine for the current mode, then loads the LM and the current profile. A
-    /// failure leaves an engine without the LM (still usable) or no engine (every key passes).
+    /// Creates the engine for the current mode on this thread, from the files, then loads the LM and the current profile (docs/spec/macos-shell.md §2.1: the first build and a layout change
+    /// stay synchronous, as the old engine would read the keys in the old layout). A failure leaves an engine without the LM (still usable) or no engine (every key passes).
     private func build() {
-        engine = nil  // free the old engine first: only one exists at a time
+        discardReady()  // a finished build waiting for the composition to end is for the old layout
+        engine = nil  // free the old engine first: the layout's build is the only one running
         rerankAvailable = false
         rerankLevels = 0
+#if SHANJIE_TIMING
+        if let dropped = rerankPending { Timing.end(dropped.job.timingSeq, 4) }
+#endif
         rerankPending = nil  // the old engine's; one still running is not applied (its engine is gone)
         loadedPackMask = 0
-        let packsDir = resources.appendingPathComponent("packs").path
-        let mask = packMask
-        // A missing pack file contributes nothing (the core builds without it), so only bits whose file is there count as loaded.
-        let present = Shell.packTable.reduce(UInt32(0)) { FileManager.default.fileExists(atPath: packsDir + "/" + $1.file) ? $0 | $1.bit : $0 }
-        var built = mask & present
-        var (made, code) = makeEngine(packsDir: mask != 0 ? packsDir : nil, packs: mask)
-        if made == nil && mask != 0 {
-            // The combined build failed, so the first code alone does not say whose fault it is. (a) Build with no packs, only to learn whether
-            // it works, and free it at once (build() keeps one engine at a time): if it fails too the cause is not a pack, both codes are logged
-            // and these two builds are all there are. (b) Otherwise a pack is broken: for each enabled pack in the settings order build with just
-            // that pack dropped (mask & ~bit); the first success wins, so the healthy packs stay on. (c) If no single drop works (two broken
-            // files), build the no-pack engine again. Only packs whose file is there are tried (a missing file contributes nothing, so dropping it
-            // cannot help); with a single such pack there is no drop to try, and the probe is kept as the engine instead of being freed and built a
-            // third time. The stored choices are untouched and nothing is shown; the next rebuild tries the packs again.
-            let packCode = code
-            built = 0
-            let live = mask & present
-            let drops = Shell.packTable.map(\.bit).filter { live & $0 != 0 && live & ~$0 != 0 }
-            var noPackWorks = false
-            var keptProbe: CoreEngine?
-            do {
-                let (probe, probeCode) = makeEngine(packsDir: nil, packs: 0)
-                noPackWorks = probe != nil
-                code = probeCode
-                if drops.isEmpty { keptProbe = probe }
-            }   // otherwise the probe engine is freed here, before any drop is built (one engine at a time)
-            if let probe = keptProbe {
-                made = probe
-                Log.shell.error("shanjie_engine_new_packs failed, code \(packCode); built with packs mask 0")
-            } else if noPackWorks {
-                var kept: UInt32 = 0
-                for bit in drops {
-                    let (dropped, _) = makeEngine(packsDir: packsDir, packs: mask & ~bit)
-                    if let dropped {
-                        made = dropped
-                        built = mask & ~bit & present
-                        kept = mask & ~bit
-                        break
-                    }
-                }
-                if made == nil { (made, code) = makeEngine(packsDir: nil, packs: 0) }
-                Log.shell.error("shanjie_engine_new_packs failed, code \(packCode); built with packs mask \(kept)")
-            } else {
-                Log.shell.error("shanjie_engine_new_packs failed, code \(packCode); the build without packs failed too")
+        engineRequested = nil
+        engineAllLoaded = false
+        let result = PackBuild.run(makePlan(shared: nil))
+        engineBuilds += result.attempts
+        packBuildShared.append(false)
+        Shell.log(result.notes)
+        guard let e = CoreEngine.adopt(result.takeEngine()) else { return }
+        setUp(e, result)
+    }
+
+    private func makePlan(shared: SharedParts?) -> PackBuildPlan {
+        let counter = engineCounter, free = engineFree
+        return PackBuildPlan(
+            dataDir: resources.path, packsDir: resources.appendingPathComponent("packs").path, layout: mode.layout, mask: packMask,
+            packs: Shell.packTable.map { ($0.bit, $0.file) },
+            modelPath: resources.appendingPathComponent("bigram.sjlm").path, tinyPath: resources.appendingPathComponent(Shell.tinyLMFile).path,
+            colloquialPath: resources.appendingPathComponent(Shell.colloquialFile).path,
+            shared: shared, ops: packBuildOps, counter: counter, engineFree: { counter.freed(); free($0) })
+    }
+
+    private static func log(_ notes: [PackBuildNote]) {
+        for note in notes {
+            switch note {
+            case .packsFailed(let code, let kept): Log.shell.error("shanjie_engine_new_packs failed, code \(code); built with packs mask \(kept)")
+            case .noPackBuildFailedToo(let code): Log.shell.error("shanjie_engine_new_packs failed, code \(code); the build without packs failed too")
+            case .newFailed(let code): Log.shell.error("shanjie_engine_new failed, code \(code)")
+            case .loadLMFailed(let code): Log.shell.error("shanjie_engine_load_lm failed, code \(code)")
+            case .loadTinyFailed(let code): Log.shell.error("shanjie_engine_load_tinylm failed, code \(code); no rerank")
+            case .loadColloquialFailed(let code): Log.shell.error("shanjie_engine_load_colloquial failed, code \(code); rerank without the colloquial term")
             }
         }
-        guard let e = made else {
-            Log.shell.error("shanjie_engine_new failed, code \(code)")
-            return
-        }
-        loadedPackMask = built
-        let lm = e.loadLM(path: resources.appendingPathComponent("bigram.sjlm").path)
-        if lm != 0 { Log.shell.error("shanjie_engine_load_lm failed, code \(lm)") }
-        // docs/spec/semantic-rerank.md §8.2, §8.3: after load_lm (which drops a small model). Missing or failed: the n-gram alone, no rerank.
-        if lm == 0 {
-            let tiny = e.loadTinyLM(path: resources.appendingPathComponent(Shell.tinyLMFile).path)
-            if tiny != 0 { Log.shell.error("shanjie_engine_load_tinylm failed, code \(tiny); no rerank") }
-            rerankAvailable = tiny == 0
-            // docs/spec/semantic-rerank.md §4.6: after load_tinylm, and only when it loaded (the term applies to the small model's rerank, so there is
-            // nothing to load it for otherwise; "no rerank" is already logged above). A failure is logged (the code only) and the rerank runs without the term.
-            if tiny == 0 {
-                let colloquial = e.loadColloquial(path: resources.appendingPathComponent(Shell.colloquialFile).path)
-                if colloquial != 0 { Log.shell.error("shanjie_engine_load_colloquial failed, code \(colloquial); rerank without the colloquial term") }
-            }
-        }
+    }
+
+    /// Makes `e` (built by `result`) the current engine: what the build loaded, then every setting the shell holds, with the values of now (docs/spec/macos-shell.md §2.1).
+    private func setUp(_ e: CoreEngine, _ result: PackBuildResult) {
+        loadedPackMask = result.loadedMask
+        rerankAvailable = result.tinyLoaded
+        engineAllLoaded = result.allLoaded
+        engineRequested = (result.requestedMask, result.layout)
         if case .failed(let c) = e.setDemote(demoteOn) {
             Log.shell.error("shanjie_engine_set_demote failed, code \(c)")
         }
@@ -1482,6 +1595,11 @@ public final class Shell {
         if case .failed(let c) = e.setFuzzy(fuzzyFlags) {
             Log.shell.error("shanjie_engine_set_fuzzy failed, code \(c)")
         }
+        // And the 變調與口語讀音 switch (docs/spec/decoder.md §6.6), every time.
+        tone3Sent.append(tone3On)
+        if case .failed(let c) = e.setTone3(tone3On) {
+            Log.shell.error("shanjie_engine_set_tone3 failed, code \(c)")
+        }
         // Same for the candidate window's orientation (docs/spec/macos-shell.md §8.6.2).
         if case .failed(let c) = e.setCandidateVertical(candidateVertical) {
             Log.shell.error("shanjie_engine_set_candidate_vertical failed, code \(c)")
@@ -1516,6 +1634,79 @@ public final class Shell {
         engine = e
     }
 
+    // MARK: pack switches (docs/spec/macos-shell.md §2.1, docs/spec/lexicon-and-packs.md §4.1–§4.3)
+
+    /// A pack switch changed `packMask`: a finished build waiting for the composition to end is stale, and an engine is built for the new mask unless one is being built
+    /// (then it is built when that one is back) or the current engine was already asked for exactly this.
+    private func packsChanged() {
+        discardReady()
+        reconcile()
+    }
+
+    /// Gives a finished build nobody will use to the builder to free (`PackBuilder.dispose`): the main thread never pays for `shanjie_engine_free` here.
+    private func discardReady() {
+        guard let r = ready else { return }
+        ready = nil
+        if let e = r.takeEngine() { packBuilder.dispose(consume e) }
+    }
+
+    /// Builds the engine for what is wanted now (mask and layout) when the current one was asked for something else and no build is running.
+    private func reconcile() {
+        guard !buildInFlight else { return }
+        if let r = engineRequested, r.mask == packMask, r.layout == mode.layout { return }
+        // The shared parts are taken here, on the engine's own thread (a few reference copies); the build owns them from now on.
+        var shared: SharedParts?
+        if let engine, engineAllLoaded {
+            let free = sharedFree
+            shared = engine.share(free: free).0
+        }
+        buildInFlight = true
+        let plan = makePlan(shared: shared)
+        packBuilder.run({ PackBuild.run(plan) }, done: { [weak self] result in self?.buildDone(result) })
+    }
+
+    /// On the main thread, from the builder. A result asked for something other than what is wanted now is dropped (its engine freed by the builder), and the newest wish is built.
+    /// A build that made no engine changes nothing: the current engine stays, the stored choices stay, and nothing tries again until the next switch.
+    private func buildDone(_ result: PackBuildResult) {
+        buildInFlight = false
+        engineBuilds += result.attempts
+        packBuildShared.append(result.usedShared)
+        Shell.log(result.notes)
+        guard result.requestedMask == packMask, result.layout == mode.layout else {
+            if let e = result.takeEngine() { packBuilder.dispose(consume e) }
+            return reconcile()
+        }
+        guard result.hasEngine else { return }
+        ready = result
+        installIfReady()
+    }
+
+    /// Hops to the main queue so the swap never runs inside the key or menu call that ended the composition.
+    private func scheduleInstall() {
+        guard ready != nil else { return }
+        DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.installIfReady() } }
+    }
+
+    /// The swap: only while the composition is empty and no candidate window or entered prediction row is open (nothing the person is typing is sent for it).
+    /// Hide the passive prediction row, free the old engine, send the settings, open the learning file, make the new engine the current one, tell the settings window.
+    func installIfReady() {
+        guard let result = ready, !composing, candidateSelected < 0 else { return }
+        ready = nil
+        let start = DispatchTime.now().uptimeNanoseconds
+        hideCandidates()
+        engine = nil
+        rerankAvailable = false
+#if SHANJIE_TIMING
+        if let dropped = rerankPending { Timing.end(dropped.job.timingSeq, 4) }
+#endif
+        rerankLevels = 0
+        rerankPending = nil
+        guard let e = CoreEngine.adopt(result.takeEngine()) else { return }
+        setUp(e, result)
+        installNanos.append(DispatchTime.now().uptimeNanoseconds - start)
+        changed()
+    }
+
     /// docs/spec/macos-shell.md §2.2: commit the composition to its owner, free the engine, rebuild with the new
     /// layout, reload the LM and the current profile.
     func switchMode(to newMode: InputMode) {
@@ -1524,8 +1715,8 @@ public final class Shell {
         Log.shell.debug("input mode switched")
     }
 
-    /// What a setting that lives in the engine's construction (layout, word pack) does: commit the
-    /// composition to its owner (or drop an orphan), apply the change, build a new engine.
+    /// What a setting that lives in the engine's construction and needs the old engine gone first (the layout) does: commit the
+    /// composition to its owner (or drop an orphan), apply the change, build a new engine here and now. A word pack switch does not come through here (`packsChanged`).
     private func commitThenRebuild(_ apply: () -> Void) {
         if composing {
             if let o = owner { o.finish(mode: 0) } else { discardOrphan() }
@@ -1612,7 +1803,8 @@ public final class Session {
     let client: TextClient
     /// docs/spec/english-mixed.md §9: the character before the cursor as far as this session knows it; `nil` when unknown. Cleared when
     /// a composition may start, read from the client by the key that may start it, set to the last character of every commit,
-    /// cleared by a pass-through key, a deactivation and an owner change. Never logged.
+    /// cleared by a pass-through key, a deactivation and an owner change. In the English state with nothing composed (`asciiSpacing`) a
+    /// printable key sets it to its character and any other key clears it. Never logged.
     private var spacingPrev: Character?
     /// docs/spec/prediction.md §9.4: this client's bundle ID as last read by `send` or passed to `applyProfile`; never read
     /// for this rule alone.
@@ -1636,6 +1828,7 @@ public final class Session {
 
     /// Returns whether the key was consumed. `event` is nil when IMK passes nil.
     public func handle(_ event: NSEvent?) -> Bool {
+        shell.flagsHandle(event)  // docs/spec/macos-shell.md §13.1: counted before anything can return, with no engine and with the Shift toggle off too
         guard shell.engine != nil else { return false }
         if let event, event.type == .flagsChanged { return handleFlags(event) }
         guard event == nil || event?.type == .keyDown else { return false }
@@ -1669,8 +1862,25 @@ public final class Session {
             showModeHint = due && !shell.composing && shell.shiftToggleOn
         }
         defer { if showModeHint { showShiftHint(shell.engineAscii ? "英" : "中") } }
-        // docs/spec/keys-and-composition.md §9.2: English state with nothing composed: every key goes to the app untouched, not through the core.
-        if shell.engineAscii && !shell.composing { return false }
+        // docs/spec/keys-and-composition.md §9.2: English state with nothing composed: keys go to the app, not through the core, except the first letter
+        // or digit after a Han character when cjk-spacing is on (`asciiSpacing`, docs/spec/english-mixed.md §9).
+        // Rule 1o there (docs/spec/keys-and-composition.md §9.2): Option with a key of the main block types the character the key gives without Option, as Apple
+        // Zhuyin's half-width mode does (measured 2026-11-20); the shell sends it itself and eats the key.
+        if shell.engineAscii && !shell.composing {
+            if let event, !event.modifierFlags.contains(.option) { return asciiSpacing(event) }
+            guard let event, event.modifierFlags.contains(.option), let key = Self.asciiKey(event), let c = UnicodeScalar(key.ch) else {
+                spacingPrev = nil  // an Option key that passes on (Option+Backspace, Option+arrow) may change the text before the cursor
+                return false
+            }
+            // p is the character the shell typed, as after any commit: an app that updates its text late cannot make the next letter read a Han
+            // character and get a space.
+            spacingPrev = Character(c)
+            client.insertText(String(Character(c)), replacementRange: NSRange(location: NSNotFound, length: 0))
+            return true
+        }
+        // The same key with a composition the core cannot keep an English run in (`shadowOn` false; reached only when the setting or the app changed under an
+        // open composition): eaten, nothing typed, the composition stays. Not measured: Apple Zhuyin has no such state.
+        if let event, shell.engineAscii, !shell.shadowOn, event.modifierFlags.contains(.option), Self.asciiKey(event) != nil { return true }
         // docs/spec/macos-shell.md §8.6.2: Page Up / Down reach the core only while the vertical window is on screen
         // and no modifier (Shift, Control, Option, Command, Caps Lock) is held; otherwise they are keys outside the tables.
         if let event, shell.verticalOpen, KeyMap.modifiers(event.modifierFlags) == 0, let kind = KeyMap.pageKeys[event.keyCode] {
@@ -1690,14 +1900,40 @@ public final class Session {
     }
 
     /// docs/spec/keys-and-composition.md §9.2: with a composition open in the English state, a printable key is sent as the character the keyboard
-    /// layout made of it (`event.characters`: Shift+1 is `!`), with no modifier bits. `nil` for anything else (Control, Option,
-    /// Command and Caps Lock keys, a non-ASCII or multi-character result, the space bar): those take the usual table.
+    /// layout made of it (`event.characters`: Shift+1 is `!`), with no modifier bits. With Option held (rule 1o, docs/spec/keys-and-composition.md §9.2), for the keys
+    /// of the main block (`KeyMap.ansi`), the character is the one the layout gives with Shift alone applied (`characters(byApplyingModifiers:)` with
+    /// the event's Shift bit: Option+Shift+; is `:`). Not `charactersIgnoringModifiers`: measured in a VM with HID-level events (2026-11-21), with Option and
+    /// Shift held it carries no Shift either (`;`). `nil` for anything else (Control, Command and Caps Lock keys, Option with any other key, a non-ASCII or multi-character
+    /// result, the space bar): those take the usual table.
     static func asciiKey(_ event: NSEvent) -> ShanjieKey? {
         let flags = event.modifierFlags
-        guard flags.isDisjoint(with: [.control, .option, .command, .capsLock]),
-              let chars = event.characters, chars.unicodeScalars.count == 1, let c = chars.unicodeScalars.first,
+        let option = flags.contains(.option)
+        guard flags.isDisjoint(with: [.control, .command, .capsLock]), !option || KeyMap.ansi[event.keyCode] != nil,
+              let chars = option ? event.characters(byApplyingModifiers: flags.intersection(.shift)) : event.characters, chars.unicodeScalars.count == 1, let c = chars.unicodeScalars.first,
               (0x21...0x7E).contains(c.value) else { return nil }
         return ShanjieKey(kind: KeyMap.char, ch: c.value, modifiers: 0)
+    }
+
+    /// docs/spec/english-mixed.md §9 (英數狀態): a key in the English state with nothing composed and no Option. With 中英文之間自動加空格 on, a letter or
+    /// digit typed right after a Han character goes in as " " + the character, inserted by the shell (the key is eaten); every other key passes on
+    /// as before. p: known and not Han -> used as is (no read, so a run of English typed fast in an app that updates its text late gets one space);
+    /// unknown or Han -> read again from the client (a click may have moved the cursor), unless learning is paused. A printable key that passes on
+    /// sets p to its character; any other key makes p unknown. Terminals and code editors with a Vim mode (`CJKSpacing.asciiExcluded`) always pass on,
+    /// as does a client whose bundle ID reads nil or empty (learning is paused for it, so p could never be read). Off: nothing changes.
+    private func asciiSpacing(_ event: NSEvent) -> Bool {
+        guard shell.spacingOn else { return false }
+        guard let key = Self.asciiKey(event), let scalar = UnicodeScalar(key.ch) else { spacingPrev = nil; return false }
+        guard let bundle = client.bundleIdentifier, !bundle.isEmpty, !CJKSpacing.asciiExcluded(bundle) else { spacingPrev = nil; return false }
+        let c = Character(scalar)
+        var p = spacingPrev
+        if p.map(CJKSpacing.isHan) ?? true {
+            p = shell.learningPause(bundle: bundle) != nil ? nil : leftContext(bundle: bundle).last
+        }
+        spacingPrev = c
+        let text = CJKSpacing.apply(previous: p, text: String(c))
+        guard text.count > 1 else { return false }
+        client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+        return true
     }
 
     /// docs/spec/keys-and-composition.md §9.1: a `flagsChanged` event is never consumed (the app sees Shift as always); a lone tap switches.
@@ -1741,10 +1977,11 @@ public final class Session {
         shell.diag.record(.toggle(bundle: DiagLog.clean(bundle), english: on, hintShown: shown))
     }
 
-    /// docs/spec/english-mixed.md §11: a key that types: what `asciiKey` takes (no Control, Option, Command or Caps Lock, one character
+    /// docs/spec/english-mixed.md §11: a key that types: what `asciiKey` takes without Option (no Control, Option, Command or Caps Lock, one character
     /// `!` to `~`; arrow and function keys carry private-use characters, so they do not count), or a plain space.
     static func isTypingKey(_ event: NSEvent) -> Bool {
-        asciiKey(event) != nil || (event.characters == " " && event.modifierFlags.isDisjoint(with: [.control, .option, .command]))
+        let flags = event.modifierFlags
+        return !flags.contains(.option) && asciiKey(event) != nil || (event.characters == " " && flags.isDisjoint(with: [.control, .option, .command]))
     }
 
     /// Hands the state of the app being typed into to the core (activate, owner change, switch, setting off).
@@ -1798,6 +2035,7 @@ public final class Session {
         applyProfile(bundle: bundle)
         syncAscii(bundle: bundle)
         shell.diag.record(.activate(bundle: DiagLog.clean(bundle), owner: shell.owner === self, english: shell.engineAscii))
+        shell.flagsBegin(self)
         shell.lastTypingAt = nil  // docs/spec/english-mixed.md §11: the next typing key shows the mode (only while the toggle is on)
         shell.armEnglishNotice()  // docs/spec/english-mixed.md §10.3
     }
@@ -1807,7 +2045,13 @@ public final class Session {
         spacingPrev = nil
         shell.hideEnglishNotice()  // docs/spec/english-mixed.md §10.3: any deactivate, owner or not, only hides the window
         // docs/spec/macos-shell.md §13.1: no bundle read here; the one this session last read.
-        shell.diag.record(.deactivate(bundle: DiagLog.clean(bundle), owner: shell.owner === self, english: shell.engineAscii))
+        let left = DiagLog.Event.deactivate(bundle: DiagLog.clean(bundle), owner: shell.owner === self, english: shell.engineAscii)
+        // `flags` right after the deactivate line, at the same moment and with the same bundle; any session, owner or not.
+        if let delivery = shell.flagsEnd(self) {
+            shell.diag.record(left, .flags(bundle: DiagLog.clean(bundle), delivery: delivery))
+        } else {
+            shell.diag.record(left)
+        }
         guard shell.owner === self else { return }
         // Never send the composition into a field that has just turned secure.
         if shell.composing { finish(mode: shell.isSecureInput() ? 1 : 0) }
@@ -1931,6 +2175,15 @@ public final class Session {
         }
     }
 
+    /// The settings window's 變調與口語讀音 switch: the snapshot is shown, if this session owns the composition.
+    func applyTone3(_ on: Bool) {
+        switch shell.setTone3(on) {
+        case .ok(let o)? where shell.owner === self: apply(o)
+        case .failed(let c)?: _ = fail(c)
+        default: break
+        }
+    }
+
     /// The orientation setting: the snapshot is shown, if this session owns the composition, but only when its `vertical` value
     /// differs from what the panel shows, i.e. a prediction row that turns (docs/spec/macos-shell.md §8.6.4). An open
     /// candidate window keeps its orientation and nothing is on screen otherwise, so those outputs are not applied again: a
@@ -1966,6 +2219,10 @@ public final class Session {
     /// docs/spec/semantic-rerank.md §8.1: a finished job, for the engine it was taken from (the shell checked that it is current). 0 shows the
     /// snapshot like any output; 5 changes nothing; anything else (4: the engine has reset itself) is handled like a failed key.
     func applyRerankJob(_ job: RerankJob, on engine: CoreEngine) {
+#if SHANJIE_TIMING
+        let timingSaved = Timing.beginApply()
+        defer { Timing.endApply(job.timingSeq, timingSaved) }
+#endif
         switch shell.rerankApply(job, engine) {
         case .ok(let o): apply(o)
         case .failed(let c) where c == SHANJIE_NO_CHANGE: break
@@ -1981,6 +2238,9 @@ public final class Session {
         if code != 0 {
             _ = fail(code)
         } else if let job {
+#if SHANJIE_TIMING
+            job.timingSeq = Timing.took()
+#endif
             shell.enqueueRerank(job, session: self, engine: engine)
         }
     }
@@ -2015,6 +2275,10 @@ public final class Session {
 
     /// The single place a key reaches the core.
     func send(_ key: ShanjieKey) -> Bool {
+#if SHANJIE_TIMING
+        let timingKey = Timing.keyBegin()
+        defer { Timing.keyEnd(timingKey) }
+#endif
         guard let engine = shell.engine else { return false }
         let bundle = client.bundleIdentifier  // a synchronous IPC: read once, for the gate and the left context's terminal check
         self.bundle = bundle
@@ -2060,6 +2324,9 @@ public final class Session {
     /// docs/spec/macos-shell.md §4: commit first, then the preedit (single underline with a thick one over the open English run, caret at
     /// cursor_utf16), then the candidates.
     private func apply(_ o: CoreOutput) {
+#if SHANJIE_TIMING
+        Timing.applyHit(0)
+#endif
         shell.composingCursor = Int(o.cursorUTF16)
         if !o.commit.isEmpty {
             var text = o.commit
@@ -2079,6 +2346,9 @@ public final class Session {
             let marked = Marked(text: o.preedit, cursor: o.cursorUTF16, runStart: o.englishRunStart, runLength: o.englishRunLength, ghost: ghost?.text ?? "")
             if marked != sentMarked || !o.commit.isEmpty {
                 client.setMarkedText(Self.marked(o, ghost: ghost?.text), selectionRange: NSRange(location: o.cursorUTF16, length: 0))
+#if SHANJIE_TIMING
+                Timing.marked()
+#endif
                 sentMarked = marked
             }
         } else if shell.composing {
@@ -2179,6 +2449,9 @@ public final class Session {
     /// does so by itself only on code 4), then the marked text and the panel are cleared and the
     /// key passes. Nothing but the code is recorded.
     private func fail(_ code: Int32) -> Bool {
+#if SHANJIE_TIMING
+        Timing.applyHit(2)
+#endif
         Log.shell.error("core call failed, code \(code)")
         if case .failed(let c)? = shell.engine?.reset(mode: 1) {
             Log.shell.error("shanjie_engine_reset failed, code \(c)")
@@ -2192,6 +2465,9 @@ public final class Session {
     private func clearMarkedText() {
         client.setMarkedText(NSAttributedString(string: ""), selectionRange: NSRange(location: 0, length: 0))
         sentMarked = nil
+#if SHANJIE_TIMING
+        Timing.marked()
+#endif
     }
 
     /// docs/spec/macos-shell.md §4: the marked text this session last sent to its client (nil after clearing it).

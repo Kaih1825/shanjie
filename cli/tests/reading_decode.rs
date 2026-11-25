@@ -1,7 +1,7 @@
 //! The reading term of the n-gram decoder (docs/spec/decoder.md §5; it is the CLI's default now, `--no-reading-decode` leaves it out). With the
 //! option the CLI is what main printed before the term existed: the summary lines of eight settings (chat and formal, with and without `--tinylm`, on
 //! dev302 and typing76 of eval/bench/suite-v1, `--context --packs acg`) and the dump of the four n-gram ones are pinned to what origin/main 533a029d printed
-//! (recorded 2026-11-01; Mac arm64, data/lm as in data/*.sha256). By default every tag ends `+rd+rx:<sha8 of data/lexicon/std-exempt.tsv>+rm`, a public row's
+//! (recorded 2026-11-01; Mac arm64, data/lm as in data/*.sha256). By default every tag ends `+rd+rx:<sha8 of data/lexicon/std-exempt.tsv>+rm+rn`, a public row's
 //! decoder first changes and the scores file's `ng` is the decoder's score with the term in it.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -39,25 +39,37 @@ fn tmp(name: &str) -> Dir {
 /// 會意 SJ-SR-8-15M file, taken again on 2026-11-06 (the file changed the small model's picks; chat has no `--colloquial-core` here): they are the
 /// `--no-reading-decode` run of this binary, equal to the same run of main's binary built before SR-TW (the decoder is untouched), and the same lines with the reading
 /// term on (the next test). The chat dev302 and typing76 rows were 265 and 74, the formal ones 271 and 74 with the 會意 SJ-SR-7-15M file.
+/// Taken again on 2026-11-23 with the 會意 SJ-SR-10-31M file (`target/release/shanjie-eval --lm data/lm/bigram.sjlm --profile P --context --packs acg --rows
+/// eval/bench/suite-v1/<set>.txt --tinylm data/lm/tinylm.sjtl --no-reading-decode --no-recur --no-tone3`): the four lines are byte for byte those of main's binary
+/// (0729130c, before the model switch) on the same file. With the 會意 SJ-SR-8-15M file they were chat 267 and 74, formal 280 and 74 (`59429922…`, `18cc1a1c…`,
+/// `c45111c8…`, `c6f729c3…`). With the new file one of them is not the default's line: `FORMAL_TYPING76_DEFAULT`.
 // The two rerank-on dev302 rows moved with the rerank-protect list (data/lexicon/rerank-protect.tsv, 2026-11-10), not with the reading term: the mask keeps
 // 祭出 (row 156, both profiles) and 改期 (row 138, formal), so chat 266 -> 267 and formal 278 -> 280; `--no-reading-decode` and the default still print the same line.
 const BEFORE: [(&str, bool, &str, usize, usize, usize, &str); 8] = [
     ("chat", false, "dev302", 302, 249, 300, "3f8a405ff0de1a327f6bfa1935b10bf24cd54b15305c1cf79b09d406da9de17c"),
     ("chat", false, "typing76", 76, 70, 75, "0b9e970b7ed1c0897711257c45ceb0e6dc7c9d8458fc3747a46d96ee752deed9"),
-    ("chat", true, "dev302", 302, 267, 300, "59429922561f5db26f4446a3e5ea438912fcbacb2bb3931d19915cbff7bdc2d8"),
+    ("chat", true, "dev302", 302, 268, 300, "f0b64d70bfa72e2e43840a5c239aa3ed321a4049933d2754da33a8c578a4db66"),
     ("chat", true, "typing76", 76, 74, 75, "18cc1a1c71f6096a1383168226abdd8539043a3b30739adb679e749c455defd2"),
     ("formal", false, "dev302", 302, 260, 300, "3c6f177cdd786ae2b28c852a065e99318bc22693c1a87bbc8b7f6f1386dee66c"),
     ("formal", false, "typing76", 76, 69, 75, "0d5dbcbb7f2913a8f8a98c6cb30a7ad0d75791f9ac6966fa63c58d7828c306a9"),
-    ("formal", true, "dev302", 302, 280, 300, "c45111c843f5ab0ee085217e36cc9b005c16bc37da1a511151e4733d4e7ff003"),
-    ("formal", true, "typing76", 76, 74, 75, "c6f729c37ffc6096151ab4acdbfd8f55457b6045cb5ea9e8186da7ba57dc8e9d"),
+    ("formal", true, "dev302", 302, 289, 300, "f509beecb4fde32865ecdd65e18e24f9c5dc8a0e9b010d56c1a55caa0c1497a4"),
+    ("formal", true, "typing76", 76, 73, 75, "2436f17667ba734e63f5787fc1a43e120922814265916dbfd7479afb59790864"),
 ];
+
+/// The default's `top1_sha256` of formal typing76 with `--tinylm` (top1 74): the one setting of `BEFORE` whose default line is not the `--no-reading-decode` one
+/// with the 會意 SJ-SR-10-31M file. Without the reading term the rerank takes row 65 to 我把向量資料庫夾好了 (rank 2); with it the choice is 架好了 (rank 1).
+/// `--no-reading-decode` alone gives the 夾好了 line; `--no-recur` alone and `--no-tone3` alone change nothing (measured 2026-11-23 with `--picks`).
+const FORMAL_TYPING76_DEFAULT: &str = "c6f729c37ffc6096151ab4acdbfd8f55457b6045cb5ea9e8186da7ba57dc8e9d";
 
 /// sha256 of the `--dump` file (all 64 candidates and their path scores) of the n-gram-only runs before the option existed.
 const DUMP_BEFORE: [(&str, &str, &str); 4] = [
-    ("chat", "dev302", "0ee1bb923a6729b5f74c02d7e4a0c75e1e1c1fe1913e6b455eb5b89b33f6e90f"),
+    // Both dev302 dumps remade when 部署 got its ㄕㄨˇ reading (docs/spec/lexicon-and-packs.md §2.9): only row 24 (他對部屬很好, typed ㄅㄨˋ ㄕㄨˇ) differs,
+    // where 部署 is now a candidate below the first; was 0ee1bb92… chat, aab77cf7… formal. Every first candidate is unchanged (部屬 stays first in row 24).
+    ("chat", "dev302", "f62110c0e2ad201ea33cbed2d20208dc74212ba9c2762001b7e4f5f83fafa622"),
     ("chat", "typing76", "cb58ab34d6319882e7e1b448236895bf75e9bbd5f503254109b14b2af92842d5"),
-    ("formal", "dev302", "aab77cf71ad8f0ee3676db9458b26008aad0f6d5d093b07d273d8fb625322047"),
-    ("formal", "typing76", "fb7dcfce1892466c26af8f48bb4b2f807149d3cccd3bd5adb9e533311b074710"),
+    ("formal", "dev302", "6813a594f0203d9ff4d05174ef5fe6051a1735224d78f826479d7ea1413d01b3"),
+    // Remade when the overlay lost its whole-word Simplified forms (docs/spec/lexicon-and-packs.md §2.3): row 66 held a candidate with 想象 (was fb7dcfce…); every first candidate is unchanged.
+    ("formal", "typing76", "8cefd23c0ad0fa750b0f11ea690e5910170b838a999c50714b0f99dd23d98b59"),
 ];
 
 fn args<'a>(profile: &'a str, tinylm: bool, rows: &'a str) -> Vec<&'a str> {
@@ -69,7 +81,8 @@ fn args<'a>(profile: &'a str, tinylm: bool, rows: &'a str) -> Vec<&'a str> {
 }
 
 /// `--no-reading-decode`: the summary line (tag, n, top1, oracle@64, top1_sha256) of eight settings is that of main before the term existed, and (macOS only:
-/// the f64 dump values round differently under the Linux libm) so is the dump of four. The tag has no `+rd`, `+rx` or `+rm`.
+/// the f64 dump values round differently under the Linux libm) so is the dump of four. The tag has no `+rd`, `+rx`, `+rm` or `+rn`. `--no-recur` too: main had
+/// no context recurrence term either (docs/spec/decoder.md §4.6).
 #[test]
 fn no_reading_decode_is_what_main_printed() {
     let dir = tmp("off");
@@ -77,7 +90,7 @@ fn no_reading_decode_is_what_main_printed() {
         let rows = format!("eval/bench/suite-v1/{set}.txt");
         let dump = dir.0.join(format!("{profile}-{set}-{tinylm}.dump")).to_string_lossy().into_owned();
         let mut a = args(profile, tinylm, &rows);
-        a.extend(["--dump", &dump, "--no-reading-decode"]);
+        a.extend(["--dump", &dump, "--no-reading-decode", "--no-recur", "--no-tone3"]);
         let o = run(&a);
         assert!(o.status.success(), "{}", text(&o.stderr));
         let line = text(&o.stdout);
@@ -97,24 +110,25 @@ fn exempt_sha8() -> String {
     core::eval::sha256_hex(&std::fs::read(root().join("data/lexicon/std-exempt.tsv")).unwrap())[..8].to_string()
 }
 
-/// By default every one of the eight settings ends its tag `+rd+rx:<sha8 of std-exempt.tsv>+rm` (the numbers of these two public sets do not move: the term acts on
-/// other rows, see the next test).
+/// By default every one of the eight settings ends its tag `+rd+rx:<sha8 of std-exempt.tsv>+rm+rn` (the numbers of these two public sets do not move, formal
+/// typing76 with the small model aside, `FORMAL_TYPING76_DEFAULT`: the term acts on other rows, see the next test).
 #[test]
 fn every_setting_ends_its_tag_with_rd_and_rx() {
-    let want = format!("+rd+rx:{}+rm  {{'n': ", exempt_sha8());
+    let want = format!("+rd+rx:{}+rm+rn+t3c  {{'n': ", exempt_sha8());
     for (profile, tinylm, set, _n, _top1, _o64, sha) in BEFORE {
         let rows = format!("eval/bench/suite-v1/{set}.txt");
         let o = run(&args(profile, tinylm, &rows));
         assert!(o.status.success(), "{}", text(&o.stderr));
         let line = text(&o.stdout);
         assert!(line.contains(&want), "{profile} {tinylm} {set}: {line}");
+        let sha = if (profile, tinylm, set) == ("formal", true, "typing76") { FORMAL_TYPING76_DEFAULT } else { sha };
         assert!(line.contains(sha), "{profile} {tinylm} {set}: public sets are not moved by the term: {line}");
     }
 }
 
 /// The effect on a public row, through the CLI (main's sentence, after wikitune): 以敵偽人員的名字命名 has the decoder first 以狄為… without the term in the written
 /// setting (formal; chat has it right already) and the right sentence with it; the scores file's `ng` of the first candidate is the decoder's path score with the term in it, the dump's (not the score without). 搞完這波 (row 37
-/// of eval/dev/user-reported.txt) keeps 波 as the first: ㄅㄛ 波 is one of the 12 exempt pairs.
+/// of eval/dev/user-reported.txt) keeps 波 as the first: ㄅㄛ 波 is one of the exempt pairs.
 #[test]
 fn the_default_decoder_first_carries_the_term_and_ng_is_its_score() {
     let dir = tmp("on");
@@ -149,9 +163,35 @@ fn the_default_decoder_first_carries_the_term_and_ng_is_its_score() {
     }
 }
 
+/// The only-reading pairs (tools/std_exempt.py's second rule): ㄏㄞ ㄏㄞ (row 188 of eval/dev/user-reported.txt) is 嗨嗨 for the n-gram decoder alone in both
+/// settings. The lexicon scores 嗨's only dictionary reading ㄏㄞ at the floor, so the term charged each 嗨 and the overlay's 咍咍 was first in chat by 3.3
+/// (above the rerank's τ, so the semantic correction never saw it); `ㄏㄞ 嗨` in std-exempt.tsv costs nothing. Without the term 咍咍 is not first either
+/// (premise: the charge was the cause, not the overlay word alone).
+#[test]
+fn the_only_dictionary_reading_of_a_character_is_not_charged() {
+    let dir = tmp("sole");
+    let rows = dir.0.join("rows.txt");
+    std::fs::write(&rows, format!("{}\n", std::fs::read_to_string(root().join("eval/dev/user-reported.txt")).unwrap().lines().nth(187).unwrap())).unwrap();
+    let rows = rows.to_string_lossy().into_owned();
+    for profile in ["chat", "formal"] {
+        for off in [false, true] {
+            let d = dir.0.join(format!("{profile}-{off}.dump")).to_string_lossy().into_owned();
+            let mut a = args(profile, false, &rows);
+            a.extend(["--dump", &d]);
+            if off {
+                a.push("--no-reading-decode");
+            }
+            let o = run(&a);
+            assert!(o.status.success(), "{}", text(&o.stderr));
+            let dump = std::fs::read_to_string(d).unwrap();
+            assert_eq!(dump.lines().next().unwrap().split('\t').nth(2), Some("嗨嗨"), "{profile}, term off {off}");
+        }
+    }
+}
+
 /// `--reading-table` / `--dump-reading-table` (evaluation only; experiments/reading-counts-b3 in the research repository). The defining property: the table
 /// `--dump-reading-table` wrote, read back by `--reading-table`, is the built-in table, so a run with it has the picks (dump, rowstats) and the summary line of a
-/// run without the option, but for the tag's `+rt:<sha8 of the file>` after `+rd+rx:...+rm`; without the option the tag has no `+rt` and the other tests above
+/// run without the option, but for the tag's `+rt:<sha8 of the file>` after `+rd+rx:...+rm+rn`; without the option the tag has no `+rt` and the other tests above
 /// pin the output. Eight settings (chat and formal, with and without `--tinylm`, dev302 and typing76).
 #[test]
 fn a_reading_table_of_the_built_in_values_changes_nothing() {
@@ -181,7 +221,7 @@ fn a_reading_table_of_the_built_in_values_changes_nothing() {
             (text(&o.stdout), std::fs::read(d).unwrap(), std::fs::read(r).unwrap())
         };
         let (off, on) = (go(false), go(true));
-        assert!(!off.0.contains("+rt") && on.0.contains(&format!("+rd+rx:{}+rm+rt:{sha8}  {{", exempt_sha8())), "{}", on.0);
+        assert!(!off.0.contains("+rt") && on.0.contains(&format!("+rd+rx:{}+rm+rn+rt:{sha8}+t3c  {{", exempt_sha8())), "{}", on.0);
         assert_eq!(on.0.replace(&format!("+rt:{sha8}"), ""), off.0, "{profile} {tinylm} {set}: summary");
         assert!(on.1 == off.1 && on.2 == off.2, "{profile} {tinylm} {set}: dump / rowstats");
     }

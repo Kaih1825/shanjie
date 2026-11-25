@@ -51,7 +51,7 @@ final class LearningTests: XCTestCase {
         XCTAssertTrue(c.client.requested.allSatisfy { $0.length <= LeftContext.maxUTF16 })
     }
 
-    // MARK: docs/spec/semantic-rerank.md §5.1: the raw text of the same message, at most 64 graphemes
+    // MARK: docs/spec/semantic-rerank.md §5.1: the raw text of the same line (after the last line break), at most 64 graphemes
 
     /// What the session passes to the core for `before` (TextEdit, not a terminal).
     private func passer() -> (String) -> String? {
@@ -133,7 +133,7 @@ final class LearningTests: XCTestCase {
     func testTerminalAppsGetOnlyTheHanTail() {
         XCTAssertEqual(LeftContext.terminals, [
             "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "com.github.wez.wezterm",
-            "org.alacritty", "co.zeit.hyper", "com.mitchellh.ghostty",
+            "org.alacritty", "co.zeit.hyper", "com.mitchellh.ghostty", "com.stablyai.orca",
         ])
         let shell = makeShell()
         for bundle in LeftContext.terminals {

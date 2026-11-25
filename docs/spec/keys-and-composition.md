@@ -56,7 +56,7 @@
 
 ### 2.2 殼送來的按鍵
 
-- 殼（`KeyMap`）只讀實體鍵碼和修飾旗標，不讀 `event.characters`：鍵碼對到 ANSI 排列的不按 Shift 的字元，所以鍵盤配置和死鍵不會改變核心收到的東西。唯一的例外是單按 Shift 切成英數狀態且組字區有字時，可印字元改送 `event.characters` 的字元（§9.2）。
+- 殼（`KeyMap`）只讀實體鍵碼和修飾旗標，不讀 `event.characters`：鍵碼對到 ANSI 排列的不按 Shift 的字元，所以鍵盤配置和死鍵不會改變核心收到的東西。唯一的例外是單按 Shift 切成英數狀態時（§9.2）：組字區有字時，可印字元改送 `event.characters` 的字元；帶 Option 的鍵改用只套 Shift 的字元（`event.characters(byApplyingModifiers:)`；組字區空時由殼直接送出）。中文模式下帶 Option 的鍵照一般的表：`ch` 是鍵位不按 Shift 的字元，修飾旗標照實帶 Shift 與 Option（Option+Shift+; 是 `;` 加 bit0、bit2），由核心的規則 1o 查表。
 - 特殊鍵：Return（36）與數字鍵盤 Enter（76）都是 Enter；空白、Backspace（51）、Forward Delete（117）、Esc、四個方向鍵、Home、End、Tab。
 - Page Up（116）、Page Down（121）不在一般的表裡；殼只在最後一次輸出的 `candidate_vertical` 為 1（直排候選窗開著）而且沒有任何修飾鍵（含 Caps Lock）時，才送成 kind 14、15。
 - 兩張表都沒有的鍵（數字鍵盤的數字、功能鍵等）不進核心：組字中時殼先送出組字區（`reset` 模式 0），再讓這個鍵直通。
@@ -72,16 +72,18 @@
 - 按聲調鍵（含空白鍵）完成音節。音節字串的格式和詞庫、評測檔相同：聲母加介音加韻母加調號，一聲不加調號，˙ 放最後（例 `ㄇㄚ˙`、`ㄕˋ`、`ㄧ`）。
 - 新音節插在游標處，游標移到它右邊。
 
-### 3.2 詞庫沒有的音節不收
+### 3.2 詞庫沒有的音節不收（例外見 §3.3）
 
 - 完成時若詞庫對這個單音節的詞條是空的，這個聲調鍵回報「已處理」，未完成音節保持原狀，組字區不變（Backspace 可以修正）。詞庫裡每個音節都有單音節詞條，所以收下的音節一定解得出來；解碼仍回錯時是內部錯誤（C ABI 的碼 4）。
-- 兩個例外都在 `finish_syllable`，順序固定：先問鄰鍵，再問回退。
+- 例外都在 `finish_syllable`，判斷順序固定：(1) 詞庫有這個音節 → 照舊收下；(2) 三聲變調的未收音節，或前一個音節打的是陽平的未收輕聲尾，或前面已有音節、沒有單字詞條而四個聲調裡有一個有單字詞條的輕聲音節 → 收下（§3.3）；(3) 鄰鍵收下 → 照舊；(4) 其他 → 照舊（不動作，或回退成英文）。
 
-### 3.3 例外：鄰鍵打錯與回退
+### 3.3 例外：鄰鍵打錯、變調與口語讀音、回退
 
 - **鄰鍵打錯**（`set_fuzzy` 的位元 4）：位元 4 開著、已載入 n-gram 語言模型、標準排列（倚天排列下沒有作用）、這個音節不在詞庫而且有鄰鍵替代讀音（同一個鍵盤列左右各一鍵）時，收下這個音節：存打的讀音，畫面照常顯示解出的字；解碼時用替代讀音，分數減 2（`DELTA_ADJACENT`）。之後把位元 4 關掉，已收下的音節照樣解碼。沒有替代讀音、沒有語言模型、位元 4 關著或倚天排列時照上面「不收」。
-- **回退成英文**（`set_english(1)`、標準排列、可省略韻母關）：鄰鍵沒有收下時，空白鍵完成詞庫沒有的音節會把按鍵還原成一個英文 token；「依按鍵順序判斷英文」開著時聲調鍵也一樣，英文段留著開。條件、影子、還原點見 `docs/spec/english-mixed.md`。回退不生效時照「不收」。
-- 驗證：`syllable_not_in_lexicon_is_rejected_composition_unchanged`（`core/tests/engine.rs`）；鄰鍵與回退的測試在 `core/tests/engine_fuzzy.rs`、`core/tests/engine_english.rs`。
+- **三聲變調**（`set_tone3`，預設開；`docs/spec/decoder.md` §6.6）：開著、已載入 n-gram 語言模型時，**未收音節**（陽平 Xˊ 沒有單字詞條、Xˇ 有，例如 ㄨㄛˊ、ㄍㄟˊ、ㄓㄢˊ），以及前一個音節打的是陽平的**未收輕聲尾**（X˙ 沒有單字詞條、Xˇ 有，例如 ㄒㄧㄤˊ 之後的 ㄒㄧㄤ˙），不看鄰鍵位元、不看排列，收下：存打的讀音，畫面照常顯示經 Xˇ 解出的字（正在打、還沒接下一個音節時也是）。中英混打時它照「詞庫裡的音節」走英文或注音的判斷點，注音分數用 Xˇ 算（`docs/spec/english-mixed.md` §16.1），不會在 (c) 回退。數字層不收變調音節（`docs/spec/english-mixed.md` §7.1）：數字層開著時，全用數字字母表的鍵、由數字層切分的未收音節或未收輕聲尾照舊是數字（ㄓㄢˊ `5 0 6` 是 506，要打本調 `5 0 3` 才是字）；數字段已經結束之後（按 ↓ 收尾再 Esc 關掉候選窗，或打了數字字母表以外的鍵），再打的聲調鍵照這一條收下；數字層關著時照這一條收下。收下之後前一個音節改了（單選、插入、刪除），未收輕聲尾照樣以 Xˇ 解碼。開關關掉時，組字區裡不在固定詞底下的未收音節，以及前一個音節（照組字區存的讀音）仍是陽平的未收輕聲尾，改存成 Xˇ，所以照樣解得出來；前一個音節照存的讀音已經不是陽平的未收輕聲尾照下一條存成分數最高的替代讀音（只看存的讀音：刪掉一個陽平後前一個又是陽平，照樣存成 Xˇ）；之後打的照上面「不收」。
+- **口語讀音的輕聲音節**（同一個開關 `set_tone3`；`docs/spec/decoder.md` §6.6）：開著、已載入 n-gram 語言模型時，打的是輕聲 X˙、X˙ 沒有單字詞條、組字區裡游標之前至少有一個已完成的音節（標點與英文 token 不算音節，所以它不會是整串的第一個音節）、而且 X、Xˊ、Xˇ、Xˋ 至少一個有單字詞條，就收下（ㄌㄧˋ 之後的 ㄏㄞ˙、ㄆㄧㄠˋ 之後的 ㄌㄧㄤ˙）：存打的讀音，畫面顯示解出的字（多字詞經輕聲來源讀到時是那個詞，例如「厲害」；否則是四個聲調裡某一個的單字）。上一條的未收輕聲尾（前一個音節是陽平、Xˇ 有單字詞條）是這個條件的子集，照上一條、行為不變。位置表看的是音節本身：X˙ 沒有單字詞條、四個聲調裡有一個有，就給替代讀音，不管它是由這一條、鄰鍵打錯（下面）或別的規則收下的；鄰鍵收下的這種音節因此改走這裡的讀法，關掉開關時也照這一條改存。收下之後不論它前面變成什麼（前一個音節被單選成別的字、中間插了音節、前面的音節全刪掉而它變成第一個），位置表都給它替代讀音，照樣解得出來。中英混打時它照「詞庫裡的音節」走英文或注音的判斷點，注音分數用 X、Xˊ、Xˇ、Xˋ 裡單字詞條分數最高的那個算（同分取前面的；`docs/spec/english-mixed.md` §16.1）。數字層不收（同上一條）：全用數字字母表的鍵打出的這種音節（ㄅㄢ˙ `1 0 7`、ㄓㄚ˙ `5 8 7`）在數字層開著時照舊是數字，每一鍵的輸出和關掉開關時相同。開關關掉時，組字區裡不在固定詞底下的這種音節改存成那個分數最高的替代讀音（前一個音節是陽平的未收輕聲尾照上一條存成 Xˇ），只有 `colloq` 列才有的固定詞解除固定，組字區不清空；之後打的照上面「不收」。C ABI：`shanjie_engine_set_tone3(engine, on, out)`，`on` 0 或 1（其他值回 2、狀態不變），重算組字區並回傳快照（回傳碼同 `set_fuzzy`），預設 1。設定：macOS 設定頁「模糊輸入」區的勾選框「變調與口語讀音」（UserDefaults 布林鍵 `tone3Sandhi`，沒有值＝開；三聲變調與口語變調共用），每次建引擎與設定改變時送一次；Windows 殼照核心預設。
+- **回退成英文**（`set_english(1)`、標準排列、可省略韻母關）：鄰鍵、三聲變調與口語讀音的規則都沒有收下時，空白鍵完成詞庫沒有的音節會把按鍵還原成一個英文 token；「依按鍵順序判斷英文」開著時聲調鍵也一樣，英文段留著開。條件、影子、按鍵紀錄與 Esc 變回注音見 `docs/spec/english-mixed.md`。回退不生效時照「不收」。
+- 驗證：`syllable_not_in_lexicon_is_rejected_composition_unchanged`（`core/tests/engine.rs`）；鄰鍵與回退的測試在 `core/tests/engine_fuzzy.rs`、`core/tests/engine_english.rs`；三聲變調的收下、輕聲尾，以及數字層開著時逐鍵和關掉變調相同，在 `core/tests/engine_tone3.rs`；口語讀音的輕聲音節（收下、前面改了之後照樣有路徑、關掉開關、數字層、分支起點的逐鍵輸出不變）在 `core/tests/engine_colloq.rs`；設定的存取與送出在 `macos/Tests/ShanjieKitTests/Tone3ShellTests.swift`。
 
 ### 3.4 多個未完成單位
 
@@ -97,7 +99,7 @@
 
 1. Page Up／Page Down：不是「直排候選窗開著、沒有修飾鍵」時，一律不處理、不改任何狀態（規則 5q）。
 2. 預測列已進入時的 ⌘⌫（規則 0）；候選窗開著時的 ⌘⌫（遺忘選取的詞，見 `docs/spec/learning.md`；規則 0a）。這兩條在規則 1 之前，否則 ⌘ 會被直通。
-3. 規則 1（修飾鍵直通）。
+3. 規則 1o（Option 加主鍵區的鍵：全形字元），再規則 1（修飾鍵直通）。
 4. 單按 Shift 切換的英數狀態（§9.3）。
 5. 已進入的預測列（規則 1a–1e）。
 6. 數字串、英文段（`docs/spec/english-mixed.md`）。
@@ -108,13 +110,14 @@
 
 由上往下，第一條符合的生效。「注音鍵」「聲調鍵」只指沒按 Shift 的鍵。
 
-按鍵習慣 1（`shanjie_engine_set_key_scheme`，見下一段）的 `m` 規則插在這個順序的下列位置：規則 1m 在第 3 步，是規則 1 的例外；規則 2m 在第 7 步，取代規則 2 對 Shift+, 、Shift+. 的處理；規則 2n 在第 8 步之前（規則 2 之後）；規則 3m–8m 在第 9 步，取代規則 3–8；規則 12m 在第 10 步，取代規則 12a、12b；規則 15m、15d、16m、16u、21m、19m 在第 10 步，各取代規則 15 的空白鍵、規則 15 的 ↓、規則 16 的聲調鍵、規則 16 的 ↑、規則 21 的 Tab、規則 19a。
+按鍵習慣 1（`shanjie_engine_set_key_scheme`，見下一段）的 `m` 規則插在這個順序的下列位置：規則 1m 在第 3 步，是規則 1 的例外，排在規則 1o 之前（兩條的修飾鍵不重疊；規則 1o 不分按鍵習慣）；規則 2m 在第 7 步，取代規則 2 對 Shift+, 、Shift+. 的處理；規則 2n 在第 8 步之前（規則 2 之後）；規則 3m–8m 在第 9 步，取代規則 3–8；規則 12m 在第 10 步，取代規則 12a、12b；規則 15m、15d、16m、16u、21m、19m 在第 10 步，各取代規則 15 的空白鍵、規則 15 的 ↓、規則 16 的聲調鍵、規則 16 的 ↑、規則 21 的 Tab、規則 19a。
 
 | # | 狀態 | 按鍵 | 行為 |
 |---|---|---|---|
 | 0 | 預測列已進入 | ⌘⌫ | 遺忘選取的那一項（不動任何固定詞）：丟掉同一個（詞、讀音）的待學記錄，照候選窗 ⌘⌫ 的規則改寫學習檔（學習暫停時也可以），重算預測列；仍是已進入，選取移到那個詞的新位置（不在列中是 0）。未進入時照規則 1 直通 |
 | 0a | 候選窗開啟 | ⌘⌫ | 遺忘反白的詞，窗保持開著（細節見 §6.6 與 `docs/spec/learning.md`）；反白在預測項目時照規則 0 的遺忘 |
-| 1 | 任何 | 帶 Option、Command、Caps Lock，或帶 Control 但不是 Ctrl+\（修飾鍵恰為 Control、字元為 `\`；Ctrl+Shift+\ 屬本條） | 不處理（直通，`handled` 0、`commit` 空），**不改任何狀態**：一段組字中間插入任意個本條的鍵，之後的輸出和沒按過時逐欄位相同。按鍵習慣 1 的 Ctrl+, 、Ctrl+. 除外（規則 1m） |
+| 1 | 任何 | 帶 Option、Command、Caps Lock，或帶 Control 但不是 Ctrl+\（修飾鍵恰為 Control、字元為 `\`；Ctrl+Shift+\ 屬本條） | 不處理（直通，`handled` 0、`commit` 空），**不改任何狀態**：一段組字中間插入任意個本條的鍵，之後的輸出和沒按過時逐欄位相同。規則 1o 的鍵（Option、Option+Shift 加主鍵區的鍵，不在 ASCII 狀態）與按鍵習慣 1 的 Ctrl+, 、Ctrl+.（規則 1m）除外 |
+| 1o | 不在 ASCII 狀態（§9.3） | Option 或 Option+Shift（沒有 Command、Control、Caps Lock）加 §8.1 Option 表的鍵：`` ` ``、`1`–`0`、`-`、`=`、`[`、`]`、`\`、`;`、`'`、`,`、`.`、`/`、a–z | 規則 1 的例外，照蘋果注音（§8.1）。**插入**（沒有未完成音節、候選窗關著、預測列沒有進入、沒有英文段與數字串；組字區空或有字都算）：把 §8.1 Option 表的字元照規則 2 當一個標點單位插入游標處（不送出），預測列照規則 2 處理，Enter 才送出。**吃掉**（有未完成音節，含只有聲母與可省略韻母的多個單位；候選窗開著；預測列已進入；英文段或數字串開著）：`handled` 1、`commit` 空，其他輸出欄位與上一個輸出相同，**不改任何狀態**，保證同規則 1：一段按鍵中間插入任意個被吃掉的鍵，之後的輸出和沒按過時逐欄位相同（顯示中的預測列、待歸鍵、短詞與自動回退的標記、前文、待學記錄都留著）。未完成音節的吃掉與兩種插入是實測；候選窗、預測列、英文段、數字串的吃掉沒有量過。ASCII 狀態下不套用，這些鍵照規則 1 直通 |
 | 1a | 預測列已進入 | 1–9（無修飾鍵） | 選預測列的第 n 個（超過個數就吃掉、不動作） |
 | 1b | 預測列已進入 | ←→、Tab（無 Shift） | 移動選取（Tab 往後），到兩端停住。設定是直排時 ↓ 同 →、↑ 同 ←，也在兩端停住；橫排時 ↑↓ 不是預測列的鍵，照規則 1e |
 | 1c | 預測列已進入 | Shift+Tab、Esc | 退回未進入（預測列保留） |
@@ -134,9 +137,9 @@
 | 7 | 候選開啟 | Esc、Backspace | 關閉候選，組字區不變 |
 | 8 | 候選開啟 | 其他鍵 | 關閉候選，再從規則 9 起處理這個鍵（Home 會真的把游標移到 0） |
 | 8a | 預測列未進入且不是空的、候選窗關閉 | Tab（無修飾鍵） | 進入預測列，選取第 0 個。預測列是空的時照規則 13、21 |
-| 9 | 有未完成音節 | 注音鍵 | 放進對應欄位（同一欄再按是取代）。例外：可省略韻母開著時已有符號的那一欄開新單位（§3.4）；回退成英文的兩種觸發（同一個位置重打、欄位逆序）見 `docs/spec/english-mixed.md`，游標不在尾端也生效 |
+| 9 | 有未完成音節 | 注音鍵 | 放進對應欄位（同一欄再按是取代）。例外：可省略韻母開著時已有符號的那一欄開新單位（§3.4）；回退成英文的兩種觸發（同一個位置重打、欄位逆序）見 `docs/spec/english-mixed.md`，游標不在尾端也生效；鍵若在這個音節之前被數字列吐成數字 token（待歸鍵），本條先決定它們是否仍可併回（`docs/spec/english-mixed.md` §7.4）；英文段開著、是聲調鍵回退（聲調提前）時的注音鍵見 §4.2 |
 | 9a | 有兩個以上未完成單位 | 聲調鍵、空白鍵 | 吃掉、不動作 |
-| 10 | 有未完成音節 | 聲調鍵、空白鍵 | 完成音節（§3.2）。回退（詞庫沒有的音節）與短詞清單見 `docs/spec/english-mixed.md` |
+| 10 | 有未完成音節 | 聲調鍵、空白鍵 | 完成音節（§3.2；三聲變調的未收音節、未收輕聲尾與口語讀音的輕聲音節照 §3.3 收下）。回退（詞庫沒有、也沒有被鄰鍵、三聲變調或口語讀音的規則收下的音節）、短詞清單與覆寫過的音節的英文項見 `docs/spec/english-mixed.md`；完成之前，緊貼游標左邊的待歸鍵可能併回這個音節（`docs/spec/english-mixed.md` §7.4）。英文 token（或游標前文字結尾的英文）後面緊接的音節，開頭幾個是中英混合詞表某一列的讀音時，解碼器在那幾個音節上多一個可以選的詞（那一列的漢字部分），剛打完讀音時畫面就是它、token 顯示表的寫法（「CP值」「T恤」）；不固定、不學習，後面再打音節時照解碼一起比（`docs/spec/decoder.md` §4.7、`docs/spec/english-mixed.md` §5.7） |
 | 11 | 有未完成音節 | Backspace | 刪掉顯示位置最後的符號（韻母、介音、聲母）。多個單位時刪最後一個單位的最後一個符號，空了的單位拿掉 |
 | 12 | 有未完成音節 | Esc | 清掉未完成音節（多個單位時是全部單位；組字區的字、固定詞、游標不動） |
 | 12a | 有未完成音節 | Enter（無修飾鍵） | 送出組字區顯示的整串：游標前的顯示文字、未完成音節的符號（照顯示順序）、游標後的顯示文字，然後清空組字區（§7.1） |
@@ -153,7 +156,7 @@
 | 20 | 組字區有字 | Esc | 清空組字區 |
 | 21 | 組字區有字 | 其他鍵（含 Shift＋非標點、Tab） | 送出組字區，然後直通這個鍵（`handled` 0、`commit` 非空）。例外：中英混打開著時 Shift＋英文字母開始或延續英文段，不送出 |
 | 22a | 組字區空 | 聲調鍵（空白鍵以外） | 把該聲調符號（ˊ ˇ ˋ ˙）放進組字區，和標點一樣（Backspace 可刪、Enter 才送出）。標準排列、數字列生效時這個鍵是數字，倚天仍是符號 |
-| 22 | 組字區空 | 其他鍵 | 不處理（直通），並清掉 `set_left_context` 存的前文。例外：中英混打開著時 Shift＋英文字母在游標處開英文段 |
+| 22 | 組字區空 | 其他鍵 | 不處理（直通），並清掉 `set_left_context` 存的前文（`left`、`left_full` 與前文重現項的漢字對集合一起清，`docs/spec/semantic-rerank.md` §5.2）。例外：中英混打開著時 Shift＋英文字母在游標處開英文段 |
 
 ### 4.1.1 按鍵習慣 1 的 `m` 規則
 
@@ -163,7 +166,7 @@
 |---|---|---|---|
 | 1m | 任何（沒有英文段、數字串、不在 ASCII 狀態） | Ctrl+, 、Ctrl+.（修飾鍵恰為 Control） | 丟掉未完成音節、關閉候選，把全形「，」（U+FF0C）、「。」（U+3002）插入組字區游標處（不送出），同規則 2 的標點單位。微軟注音的量測只有游標在組字尾端的情況；游標在組字中間時沒有量，這裡照規則 2 插在游標處 |
 | 2m | S3 | Shift+, 、Shift+. | 吃掉、不動作，窗開著、組字不變 |
-| 2m | S0 | Shift+, 、Shift+. | 不處理（直通，同規則 22 清掉前文），App 收到 `<` `>` |
+| 2m | S0 | Shift+, 、Shift+. | 不處理（直通，同規則 22 清掉前文與漢字對集合），App 收到 `<` `>` |
 | 2m | S1 且組字區沒有字 | Shift+, 、Shift+. | 丟掉未完成音節，`commit` 是 `<` 或 `>`、`handled` 1、組字區空。不直通：IMM32 宿主會吞掉「先宣告吃、再放行」的鍵（`docs/spec/windows-tip.md` §5.4） |
 | 2m | S1 且組字區有字，或 S2 | Shift+, 、Shift+. | 丟掉未完成音節（若有），在游標處插入半形 `<` `>` 單位（讀音 `_punct_`＋字元，同 `set_ascii` 的半形標點單位） |
 | 2n | S1 且組字區沒有字 | Shift＋字母 | 丟掉未完成音節，`commit` 是大寫字母、`handled` 1、組字區空（理由同上） |
@@ -202,7 +205,7 @@
 
 ### 4.2 規則表之外的狀態
 
-- **英文段與數字串**（Shift＋字母、回退、單按 Shift 的英數狀態、數字列的鍵）：開著時先看按鍵，規則 2 以下的順序不適用；規則見 `docs/spec/english-mixed.md`。
+- **英文段與數字串**（Shift＋字母、回退、單按 Shift 的英數狀態、數字列的鍵）：開著時先看按鍵，規則 2 以下的順序不適用；規則見 `docs/spec/english-mixed.md`。其中兩條和中英混合詞表有關：Shift 開的英文段是「大寫字母＋注音鍵」時，空白或聲調鍵在表裡有那個字母接那個音節的列時切成英文 token 加音節（Shift+K `g j ␣` 是「K書」，`docs/spec/english-mixed.md` §4.3）；Shift 開的英文段全是字母時有預測列：只有大寫字母時先列表裡那些字母的詞，再列以目前字母開頭的英文字，Tab 進入後 Enter 或數字鍵選（`docs/spec/prediction.md` §3.5）。被切開的英文字留在 ↓ 清單（`docs/spec/english-mixed.md` §4.3）。
 - **預測列**：有語言模型、游標在組字區尾端、候選窗關閉時，規則 9、10、11、14 處理完會重算；其他狀態變化都清掉；什麼都沒改的鍵保留它。規則見 `docs/spec/prediction.md`。
 - **語意校正套用**（`apply_rerank`，不是按鍵）：一段的 n-gram 第一名含有手動加的詞（疊加層標 `manual`）時，重排只換成在同樣音節上仍保有這些詞的候選。見 `docs/spec/semantic-rerank.md`。
 
@@ -222,6 +225,7 @@
 - 候選邊界：↑↓ 在第一個、最後一個停住不繞回；只有收合時的空白鍵會從最後一頁繞回第一頁。候選為空時不開窗，空白與 ↓ 是「已處理、忽略」。
 - 游標位置：`cursor_utf16` 等於游標前的顯示字元的 UTF-16 長度加未完成音節的 UTF-16 長度；一個音節在顯示字串裡佔一個字元，標點則佔它的固定詞的字數（`⋯⋯` 佔兩個）。
 - 直通的輸出（規則 1、22）是目前狀態的快照：`handled` 0、`commit` 空。
+- **前文與組字開始**：殼只在沒有修飾鍵（或只有 Shift）的字元鍵開始組字前呼叫 `set_left_context`。其他在空組字區開始組字的鍵（例如 Ctrl+\）沒有先設前文，Backspace 刪到空與只有未完成符號時按 Esc 也不清前文，所以核心在 `key()` 進來時，若組字區是空的（沒有音節、沒有進行中的英文、沒有未完成符號、沒有開著的數字緩衝），而且上一個鍵之後沒有呼叫過 `set_left_context`，就先清掉前文與漢字對集合；組字中不清。
 - 取代後的 Backspace：同一欄被取代時新符號直接換掉舊符號，不會還原舊符號。
 - 中英切換：系統的「使用大寫鎖定鍵切換輸入方式」切換時系統停用本輸入法，殼在停用時送出或丟棄組字區；Caps Lock 帶著的按鍵走規則 1。另有選用的單按 Shift 切換（§9）。
 
@@ -274,7 +278,7 @@
   - `the_freeze_has_a_buffer_and_needs_neither_the_rerank_nor_the_model`：四種設定各連打 128 個音節，每個自由段都 ≤ W，解碼兩次的鍵數 ≤ ⌈(字數 − W) ÷ H⌉ + 1（拿掉緩衝或把條件寫成「語意校正開」時失敗）。
   - `a_word_the_user_picked_is_never_frozen_over`：手動改選的詞不被固定動到。
   - `a_forgotten_head_word_is_not_frozen_back_in_the_same_key`、`a_composition_typed_before_a_model_has_no_path_to_freeze_from`、`rows_rebuilt_by_a_forget_come_from_the_decode_after_the_freeze`。
-- 延遲：`core/tests/engine_predict.rs` 的 `timing_composition_cap_128_syllables`（`cargo test --release -p core --test engine_predict timing_composition_cap -- --ignored --nocapture`，低負載下跑）。重播 128 個音節的長句（語意校正開、會意與常談載入），5 輪取中位數，斷言語意校正開的按鍵路徑 p95 < 16 ms、`RerankJob::run` 的 p95 < 300 ms、語意校正關的按鍵路徑 p95 < 16 ms。驗收時量到按鍵路徑 p95 約 13 ms、`RerankJob::run` 約 40 ms，單鍵最大值低於 50 ms。
+- 延遲：`core/tests/engine_predict.rs` 的 `timing_composition_cap_128_syllables`（`cargo test --release -p core --test engine_predict timing_composition_cap -- --ignored --nocapture`，低負載下跑）。重播 128 個音節的長句（語意校正開、會意與常談載入），5 輪取中位數，斷言語意校正開的按鍵路徑 p95 < 16 ms、`RerankJob::run` 的 p95 < 300 ms、語意校正關的按鍵路徑 p95 < 16 ms。驗收時量到按鍵路徑 p95 約 13 ms、`RerankJob::run` 約 40 ms，單鍵最大值低於 50 ms。GitHub Actions 的 macOS runner 太慢，這個測試在那裡不過（語意校正關的每鍵 p95 量到 25～31 ms），所以只在閒置的 Mac 上判；`latency-gate.yml` 照報它的數字（`docs/spec/release-and-ci.md` §8.4）。
 - 重播評測：`shanjie-replay --rerank each`（與 `core/tests/engine_replay.rs`）在 dev302、打字測驗、錯字回報，聊天與書面兩種設定，`top1_sha256` 和固定規則加入前相同（評測集沒有超過 32 個音節的列，不會碰到這條規則）。
 
 ## 6. 候選與固定詞
@@ -285,7 +289,7 @@
 - 列出讀音等於 `音節[a−L..a]`（a 為 0 時是 `音節[0..L]`）的所有詞，L 從 `min(max(詞庫最長讀音, 4), 可用長度)` 遞減到 1；同一個 L 內：選字記憶裡這個讀音的新詞先列（權重由高到低），再照詞庫順序（分數由高到低）；同一個字串只出現第一次。
 - 開窗的鍵之前顯示著未進入的預測列時，清單最前面是預測列的項目，詞庫清單接在後面並去掉預測列已有的詞（`docs/spec/prediction.md`）。
 - 異體寫法：詞庫載入時已把少用寫法的分數壓到常用寫法之下，所以清單裡常用寫法在前；預測列帶進窗之後少用寫法在前時，再把少用寫法移到常用寫法的緊後面（少用寫法帶學習權重時不移）。不受任何設定影響（`docs/spec/decoder.md`）。
-- 模糊輸入開著時，清單在所有完全吻合的詞之後列出容錯得到的詞（長讀音在前、同讀音照分數）；選了以後那一段換成詞的詞庫讀音。
+- 模糊輸入開著時，清單在所有完全吻合的詞之後列出容錯得到的詞（長讀音在前、同讀音照分數）；變調與口語讀音開著時（預設），完全吻合的詞裡含那個讀音的 `colloq` 列（`docs/spec/decoder.md` §8.7），同一段再接變調、輕聲音節的單字替代讀音與輕聲來源得到的詞（`docs/spec/decoder.md` §6.6）；選了經替代讀音得到的詞以後那一段換成詞的詞庫讀音。
 - 分頁：收合每頁 9 個；開啟時在第一頁、選取第 0 個。
 - 驗證：`core/tests/engine.rs` 的 `row15_candidate_range_order_and_dedup`、`candidates_never_span_punctuation`。
 
@@ -342,7 +346,7 @@
 - 組字區有字、無修飾鍵的 Enter（規則 19、12a）：送出組字區顯示的整串，未完成的注音符號照它在畫面上的位置一起送出（游標在中間打「你好嗎」← 兩次再打 ㄅ，Enter 送出「你ㄅ好嗎」），然後清空組字區；只有未完成音節時送出那幾個符號（ㄅ、ㄋㄧ）。`handled` 1。與蘋果注音實測相同。
 - Shift+Enter（規則 19a、12b）：先送出同樣的整串，再直通這個鍵（`handled` 0、`commit` 非空），App 收到換行。蘋果注音相同。
 - 候選窗開著、預測列已進入時，Enter 與 Shift+Enter 都是選取（規則 6、1d），不送出也不換行。
-- Option、Command、Control＋Enter 走規則 1，直通且不改狀態；數字鍵盤的 Enter 與 Return 同一種按鍵。
+- Option、Command、Control＋Enter 走規則 1，直通且不改狀態（Enter 不是規則 1o 的鍵）；數字鍵盤的 Enter 與 Return 同一種按鍵。
 - 學習只看組字區已解出的部分（`learn_commit` 的輸入是解碼後的顯示文字，不含未完成符號）；未完成的符號不學、不進前文鍵。預測列清掉。
 - 驗證：`core/tests/engine.rs` 的 `enter_commits_what_is_shown_unfinished_symbols_included`（只有未完成音節、尾端有未完成音節、游標在中間、Shift+Enter 有無未完成音節、⌘Enter 直通且規則 13 仍吃掉 ↑）；`macos/Tests/ShanjieKitTests/ShellTests.swift` 的 `testShiftEnterCommitsThenPassesTheKeyOn`。
 
@@ -350,7 +354,7 @@
 
 - **規則 21**：組字區有字時按了核心不處理的鍵（Shift＋非標點、Tab 等），送出組字區再直通這個鍵。
 - **自動送出**：第 128 個單位（§5.2）。
-- **`reset`**：模式 0 送出目前顯示的整串（含未完成音節，與 Enter 相同，所以失焦時打的注音不會無聲消失；開著的英文段以它的寫法送出，`docs/spec/english-mixed.md` §4.4，也與 Enter 相同）後清空，不學習；模式 1 丟棄。兩者都清掉組字區、固定詞、前文，不清語言模型、設定與 ASCII 狀態。殼在 `commitComposition`、停用（輸入框變成密碼欄時改丟棄）、組字擁有者改變、表外按鍵時呼叫。
+- **`reset`**：模式 0 送出目前顯示的整串（含未完成音節，與 Enter 相同，所以失焦時打的注音不會無聲消失；開著的英文段以它的寫法送出，`docs/spec/english-mixed.md` §4.4，也與 Enter 相同）後清空，不學習；模式 1 丟棄。兩者都清掉組字區、固定詞、前文（含漢字對集合），不清語言模型、設定與 ASCII 狀態。殼在 `commitComposition`、停用（輸入框變成密碼欄時改丟棄）、組字擁有者改變、表外按鍵時呼叫。
 - 送出、Esc 清空、`reset` 時，連同固定詞清掉所有組字狀態。
 - 驗證：`reset_both_modes_equal_fresh_engine`、`auto_commit_at_128th_syllable`（`core/tests/engine.rs`）。
 
@@ -361,7 +365,7 @@
 - 等候放在 `claim()`、`applyProfile`、`syncAscii` 之後、Enter 的 `send` 之前（放在前面，設定變更會讓工作過期）。
 - 上限 `ENTER_RERANK_WAIT_MS` = 100 ms，**整次 Enter 一個期限**：Enter 到時用單調時鐘算期限，有一個在跑、一個在排隊時每次等候只給剩下的時間；過了期限就送出畫面上的字（沒有等候時的行為），還在跑的工作完成後被丟掉。等候期間主執行緒不處理別的事件，所以按鍵順序不變。
 - 實作約束：阻塞式等候，用每個工作各自的信號量（初始 0，`run()` 回傳之後才發訊號，不共用一個）；不用巢狀 run loop，不用無上限的 `wait()`；碼在發訊號之前寫進盒子（`Synchronization.Mutex`）。等到之後由殼直接呼叫完成處理（`rerankFinished`，與非同步完成同一條路徑），原本排進主佇列的那次回呼只在「handle 還是殼目前的執行中 handle 而且還沒完成」時才處理，比對用強參照 `===`，所以同一個工作只完成一次、`rerankRunning` 不會卡住。
-- 已知限制：等候不提升推論佇列（`.utility`）的優先權，負載高時可能逾時，退回舊行為。同步套用回 4（引擎重設）時照舊由 `fail()` 處理。
+- 已知限制：推論佇列的 QoS 是 `.userInitiated`，等候本身不再另外提升它的優先權；負載高時仍可能逾時，退回舊行為。同步套用回 4（引擎重設）時照舊由 `fail()` 處理。
 - 設計取捨：上限取高於量到的最大值（虛擬機上最後一個重排工作 33 到 84 ms，Mac 上 dev302 每列 p95 約 12.6 ms）。這是「按鍵不等語意校正」的唯一例外，只有 Enter 等，而且只在有工作時；其他送出路徑（換 App、點滑鼠、`commitComposition`、自動送出）不等。
 - 驗證：`macos/Tests/ShanjieKitTests/RerankTests.swift` 的 `testEnterWaitsForTheRunningJobAndSendsTheRerankedText`、`testEnterWaitsForTheRunningAndTheWaitingJob`、`testEnterAfterTheLimitSendsTheShownTextAndTheQueueGoesOn`、`testEnterDoesNotWaitWithoutAJobOrWithTheSwitchOffOrAnEmptyOrSelectedComposition`、`testOneDeadlineForTheWholeEnter`、`testEnterWaitsForTheRealQueue`（真實佇列；出貨常數 100 ms 另斷言）。指令：`make test-swift`；資料競爭另用 `swift test --sanitize=thread --filter RerankTests` 檢查。
 
@@ -387,6 +391,26 @@
 | \ | 、 | ' | ‘ |
 | = | ＝ | ` | · |
 
+Option 表（規則 1o；修飾鍵恰為 Option，或 Option 加 Shift）：
+
+| 鍵 | Option | Option+Shift |
+|---|---|---|
+| `` ` `` | ｀（U+FF40） | ～（U+FF5E） |
+| `1` `2` `3` `4` `5` `6` `7` `8` `9` `0` | １２３４５６７８９０（U+FF11–FF19、U+FF10） | ！＠＃＄％＾＆＊（）（U+FF01、FF20、FF03、FF04、FF05、FF3E、FF06、FF0A、FF08、FF09） |
+| `-` | —（U+2014） | ＿（U+FF3F） |
+| `=` | ＝（U+FF1D） | ＋（U+FF0B） |
+| `[` | 「（U+300C） | 『（U+300E） |
+| `]` | 」（U+300D） | 』（U+300F） |
+| `\` | 、（U+3001） | ｜（U+FF5C） |
+| `;` | ；（U+FF1B） | ：（U+FF1A） |
+| `'` | ‘（U+2018） | “（U+201C） |
+| `,` | ，（U+FF0C） | 《（U+300A） |
+| `.` | ．（U+FF0E） | 》（U+300B） |
+| `/` | ／（U+FF0F） | ？（U+FF1F） |
+| a–z | 全形小寫 ａ–ｚ（U+FF41–FF5A） | 全形大寫 Ａ–Ｚ（U+FF21–FF3A） |
+
+- Option 表照蘋果注音在虛擬機（macOS 26.6.2）用 HID 層的按鍵事件實測（2026-11-20）：上表字母以外的 42 格全量過，字母量了 a、u 兩個鍵，其他字母照同一個規律，沒有量。蘋果注音的 Option+Shift+B／L／H／E 另有功能（符號視窗、尋找輸入碼、半形標點、說明），善解不做，這幾個鍵照字母出全形大寫。組字區空時字元進組字區、不直接送出（接著的 Return 被吃掉、送出那個字元）；組字區有完整的字時插在游標處（ㄘㄜˋ 之後按 Option+; 再按 Return 得到「測；」）；最後是未完成音節時沒有作用（只有 ㄘ 時按了再按 Return，送出的是 ㄘ；「測」後接 ㄘ 時得到「測ㄘ」）。蘋果注音的半形英文模式下 Option 沒有效果，見 §9.2。程式裡是 `OPTION_KEYS`、`OPTION_PLAIN`、`OPTION_SHIFT`（各 21 個）與 `option_char`。非美式鍵盤配置照實體鍵位（§2.2），沒有量。
+- 驗證：`core/tests/engine_option.rs`（每一格在空的組字區插入、Enter 送出，規則 2 有同一個字元的鍵時兩者輸出逐欄位相同；有字時插入；每一種吃掉的狀態在之後的按鍵序列上與沒按時逐欄位相同，含待歸鍵；ASCII 狀態與帶 Command、Control、Caps Lock 的組合、Option 加方向鍵、Backspace、空白、Enter、Tab 照規則 1 直通）。
 - Shift 表只認修飾鍵恰為 Shift；單按表只認沒有修飾鍵。倚天排列的 `'`、`=` 是注音鍵，照舊。程式裡是 `SHIFT_PUNCT`（13 個）與 `PLAIN_PUNCT`（6 個）。
 - 表照蘋果內建繁體注音（`com.apple.inputmethod.TCIM.Zhuyin`）用只對自己視窗送鍵的探測程式實測，沒有複製蘋果的任何資料檔。
 - 驗證：`core/tests/engine.rs` 的 `row2_unshifted_bracket_row_is_punctuation`、`row2_punctuation_goes_into_the_composition`。
@@ -454,23 +478,24 @@
 
 - 英數狀態每個 App（`client.bundleIdentifier`）各自一個布林，存在殼的記憶體裡（輸入法程序重開就回到中文；新 App 預設中文）。殼在 `activate`、組字擁有者改變、切換、設定關閉時把這個 App 的狀態交給核心（`set_ascii`）。
 - **一個控制器只動它自己這個 App**：`Session` 另存 `knownBundle`，最近一次讀到的非空 bundle ID（`activate`、換 owner、切換這三處讀到非空就更新，讀到 nil 或空字串不覆蓋；設定關著時也照樣記）。英數狀態用的 App 鍵在讀到 nil 或空字串時改用 `knownBundle`；`knownBundle` 也是 nil（從來沒讀到過）才用共用的 `""`。這個後備只用在英數狀態的鍵：`applyProfile` 的 bundle、`bundle` 欄位與瀏覽器首音節規則、學習閘門與前文、選單的暫停學習與「這個 App 用聊天設定」，nil 一律照舊。
-- **組字區是空的、英數模式**：所有按鍵直通給 App（`handle` 回 false，不經核心），包括標點與空白。
-- **組字區有字、英數模式**：殼照常把鍵送進核心，但可印字元的鍵（`event.characters` 是一個 ASCII `0x21`–`0x7E` 的字元，沒有 Control、Option、Command、Caps Lock）送 `ShanjieKey(kind: char, ch: 那個字元, modifiers: 0)`；字元照目前鍵盤配置從 `event.characters` 取（Shift＋`1` 是 `!`），不是鍵帽。空白鍵、Enter、Backspace、Esc、方向鍵照組字區的規則。核心沒有影子可用時（`shadowOn` 為 false：倚天排列、可省略韻母、中英混打關著）不送 ASCII 字元。
+- **組字區是空的、英數模式**：按鍵直通給 App（`handle` 回 false，不經核心），包括標點與空白。例外是帶 Option 的鍵（下一條），以及「中英文之間自動加空格」開著時，漢字後面的第一個英數字由殼補一個空白送出（`docs/spec/english-mixed.md` §9「英數狀態」；終端機與有 Vim 模式的編輯器除外）。
+- **英數模式下帶 Option 的鍵**（Option 或 Option+Shift，沒有 Command、Control、Caps Lock，鍵是 `KeyMap` 的字元鍵，也就是規則 1o 的那些鍵）：Option 沒有效果，出的是那個鍵不帶 Option 的字元，照蘋果注音的半形英文模式（實測 Option 加 `; , . / a` 出 `; , . / a`，再加 Shift 出 `: < > ? A`，直接送出、之後的 Return 照常換行；其他鍵照同一個規律，沒有量）。字元用 `event.characters(byApplyingModifiers:)` 取，修飾鍵只給事件的 Shift（照目前鍵盤配置、保留 Shift、去掉 Option；美式配置下 Option+Shift+; 是 `:`）；不用 `event.charactersIgnoringModifiers`：實測（虛擬機、HID 層的按鍵事件）Option 與 Shift 同時按著時它連 Shift 也沒有套用（Option+Shift+; 是 `;`）。取到的不是一個 ASCII `0x21`–`0x7E` 的字元時照原本的規則。組字區空：殼自己用 `insertText` 送出那個字元並吃掉這一鍵（`handle` 回 true），不經核心。組字區有字、核心有影子：和下一條一樣送 `ShanjieKey(kind: char, ch: 那個字元, modifiers: 0)`。組字區有字、核心沒有影子（`shadowOn` 為 false；只有設定或 App 在組字中途改變時才到得了）：殼吃掉這一鍵，不出字、組字區不變（沒有量過，蘋果注音沒有對應的狀態）。帶 Option 的其他鍵（方向鍵、Backspace、空白、Enter 等）與再加 Command、Control、Caps Lock 的組合照舊。
+- **組字區有字、英數模式**：殼照常把鍵送進核心，但可印字元的鍵（`event.characters` 是一個 ASCII `0x21`–`0x7E` 的字元，沒有 Control、Option、Command、Caps Lock；帶 Option 的見上一條）送 `ShanjieKey(kind: char, ch: 那個字元, modifiers: 0)`；字元照目前鍵盤配置從 `event.characters` 取（Shift＋`1` 是 `!`），不是鍵帽。空白鍵、Enter、Backspace、Esc、方向鍵照組字區的規則。核心沒有影子可用時（`shadowOn` 為 false：倚天排列、可省略韻母、中英混打關著）不送 ASCII 字元。
 - **核心沒有英文段可用時**：組字區有字時切到英數，殼先照 Enter 送出組字區（`reset` 模式 0），再進英數模式。
 - 回中文：再單按 Shift。Caps Lock 燈亮時單按 Shift 不切換；英數模式不改變 Caps Lock 鍵的行為（規則 1 直通）。安全輸入（密碼欄）時殼不送鍵給核心，英數模式不改變這一點。
-- 驗證：`ShiftToggleSessionTests`（`testTapSwitchesAndShowsTheHintAtTheInsertionPoint`、`testEnglishWithNothingComposedPassesEveryKeyThrough`、`testComposedTextIsKeptAndTheNextCharactersAreEnglish`、`testShiftOneIsTheCharacterTheKeyboardMadeNotTheKeycap`、`testEachAppRemembersItsOwnState`、`testANilBundleReadToggleUsesTheKnownApp`、`testAnEmptyBundleReadToggleUsesTheKnownApp`、`testSessionsActivatedWithTheToggleOffStillKnowTheirApp`、`testAClientThatNeverReadABundleIDSharesTheEmptyEntry`、`testWithoutAShadowTheCompositionIsSentFirst`、`testSettingOffStopsTheTapAndClearsEveryApp`、`testAsciiKeysAreNotSentWithoutAShadow`、`testARightShiftTapSwitchesToo`）。
+- 驗證：`ShiftToggleSessionTests`（`testTapSwitchesAndShowsTheHintAtTheInsertionPoint`、`testEnglishWithNothingComposedPassesEveryKeyThrough`、`testComposedTextIsKeptAndTheNextCharactersAreEnglish`、`testShiftOneIsTheCharacterTheKeyboardMadeNotTheKeycap`、`testEachAppRemembersItsOwnState`、`testANilBundleReadToggleUsesTheKnownApp`、`testAnEmptyBundleReadToggleUsesTheKnownApp`、`testSessionsActivatedWithTheToggleOffStillKnowTheirApp`、`testAClientThatNeverReadABundleIDSharesTheEmptyEntry`、`testWithoutAShadowTheCompositionIsSentFirst`、`testSettingOffStopsTheTapAndClearsEveryApp`、`testAsciiKeysAreNotSentWithoutAShadow`、`testARightShiftTapSwitchesToo`、`testOptionInEnglishWithNothingComposedTypesTheKeyWithoutOption`、`testOptionInEnglishWithACompositionSendsTheCharacterToTheCore`、`testOptionInEnglishWithoutAShadowIsEatenAndChangesNothing`、`testOptionInChineseComposesTheFullWidthCharacter`）。
 
 ### 9.3 核心的 ASCII 狀態（`set_ascii`）
 
 - `shanjie_engine_set_ascii(on)`（預設 0）是殼依 App 交給核心的狀態；`reset`、送出都不清它。回傳快照（`commit` 可能非空，例如結束英文段時組字區到第 128 個單位整個送出）。組字區是空的時只記下狀態。
-- **`set_ascii(1)`**（核心的 `shadow_on()` 為 false 時只記下狀態，組字區不動，ASCII 字元分支也不適用），照順序：(1) 候選窗或預測列開著 → 關掉，不選；(2) 數字串開著 → 照數字層的邊界規則結束（緩衝吐成 token）；(3) 有未完成音節 → 影子的鍵照打的順序成為英文段的開頭（和 Shift＋字母開段相同，打 ㄏ 再切英數，段是 `c`）；(4) 沒有英文段 → 下一個字元進來時在游標處開一段（空段不存在）。
-- **ASCII 狀態下的鍵**：緊接在規則 1 之後、在已進入的預測列、Tab 進預測列、數字串、英文段、候選窗之前，而且核心有影子可用：`kind` 是 char、`ch` 是 `0x21`–`0x7E`、沒有修飾位元 → 先關掉候選窗或預測列（不選，所以 `1` 永遠是字元，不是選字）。
+- **`set_ascii(1)`**（核心的 `shadow_on()` 為 false 時只記下狀態，組字區不動，ASCII 字元分支也不適用），照順序：(1) 候選窗或預測列開著 → 關掉，不選；(2) 數字串開著 → 照數字層的邊界規則結束（緩衝吐成 token）；(3) 有未完成音節 → 它的按鍵紀錄（照打的每個鍵，含被覆寫掉的）成為英文段的開頭（和 Shift＋字母開段相同，打 ㄏ 再切英數，段是 `c`）；(4) 沒有英文段 → 下一個字元進來時在游標處開一段（空段不存在）。
+- **ASCII 狀態下的鍵**：規則 1o 不套用（帶 Option 的鍵照規則 1 直通；殼在英數模式下先把它們轉成不帶 Option 的字元，§9.2）。緊接在規則 1 之後、在已進入的預測列、Tab 進預測列、數字串、英文段、候選窗之前，而且核心有影子可用：`kind` 是 char、`ch` 是 `0x21`–`0x7E`、沒有修飾位元 → 先關掉候選窗或預測列（不選，所以 `1` 永遠是字元，不是選字）。
   - 字元是英文段收的（`[A-Za-z0-9,.;/-]`）→ 原樣接進英文段（沒有段就開一段；不轉小寫、不走聲調鍵、不回退、不切分；段長上限 32，第 33 個先結束前一段）。
   - 其他可印字元（`! ? @ ' ( :` 等）→ 先把開著的英文段結束成 token（不插空白），再以這個字元本身當一個半形標點單位（讀音 `_punct_` 加字元；Backspace 整個刪掉；它不是英文 token，所以每個英文 token 都守英文段的字元集不變量）。
   - 一個字元的英文段是數字（`3`）或 `.`、`/`、`-` 時，結束成的是數字 token。
   - **空白鍵**：沒有英文段開著、游標緊接在任何 token 單位之後（英文 token、半形標點單位、數字 token、空白單位），而且窗與預測列都沒開 → 打一個半形空白單位（規則 16a）；有英文段開著 → 結束它（下一個空白鍵才打空白）。所以 `Hi! there`、`3 apples` 都打得出來。其他鍵照一般規則（↓ 開寫法清單、Enter 送出、Backspace 刪段的最後一個字元）。
 - **`set_ascii(0)`**：開著的英文段結束成 token（不插空白），回到一般規則；組字區其他部分不動。
-- 規則細節（英文段、影子、token）見 `docs/spec/english-mixed.md`。
+- 規則細節（英文段、影子、按鍵紀錄、token）見 `docs/spec/english-mixed.md`。
 - 驗證：`core/tests/engine_english.rs`（「我要」＋`set_ascii(1)`＋`ok`＋Enter 送出「我要ok」；`set_ascii(0)` 之後的注音照常；候選窗與預測列在 `set_ascii(1)` 時關閉；數字串先吐成 token；`!`、`3`、`/`、大寫 `O` 原樣接進段）；`core/src/ffi.rs` 的 `english_codes_through_the_c_abi` 涵蓋 `on` 不是 0／1 回 2。
 
 ### 9.4 英／中提示

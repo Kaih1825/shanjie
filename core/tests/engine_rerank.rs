@@ -94,7 +94,7 @@ fn expect_key(model: &Path, syls: &[String], start: &str, end: End<'_>, key: &st
     let ng: Vec<f64> = top.iter().map(|x| x.0).collect();
     let cands: Vec<&str> = surfaces.iter().map(String::as_str).collect();
     let tl = TinyLm::load(model).unwrap();
-    let pick = tl.rerank(&ng, &cands, key, tl.alpha_tau_delta(Profile::Chat), &[], &Default::default(), &Default::default()).unwrap().0;
+    let pick = tl.rerank(&ng, &cands, key, tl.alpha_tau_delta(Profile::Chat), &[], &Default::default()).unwrap().0;
     Expect { surfaces, ng, pick }
 }
 
@@ -373,6 +373,40 @@ fn a_declared_left_length_keys_with_the_last_l_characters() {
     let r = e.take_rerank_job().unwrap().run();
     assert_eq!(r.keys(), vec![context_key(""), context_key(&chosen)], "version 4: today's keys");
     assert_eq!(r.picks(), vec![left.pick, right.pick]);
+}
+
+/// docs/spec/semantic-rerank.md §5.2 (sep-longkey): a version 6 boundary-format model (L 8, K 1) keeps only its L characters, like version 5,
+/// and keys every stretch with `TinyLm::key_for_len` of the last L characters of the text before it and of the longest candidate the
+/// rerank scores (the stretch's pool): the boundary-format key, [SEP] as NUL, never the version 5 key. The characters before the
+/// window never reach the key, and the job is the same for a longer text with the same last 8 characters.
+#[test]
+fn a_boundary_model_keys_each_stretch_with_key_for_len() {
+    let v1 = rerank_model();
+    let v6 = upgraded_boundary(&v1, 8, 1);
+    let tl = TinyLm::load(&v6).unwrap();
+    assert_eq!((tl.left_len(), tl.boundary_k()), (Some(8), Some(1)));
+    let text = "昨天我們去看了Joe的表演，";
+    let syls = row(16);
+    let (b, word) = (4, "打");
+    let run = |text: &str| {
+        let mut e = engine_with(Some(&v6));
+        e.set_left_context(text);
+        assert_eq!(e.left_full_chars(), 8, "only the declared length is kept");
+        fix_word(&mut e, &syls, b, word);
+        let job = e.take_rerank_job().unwrap();
+        let cands = job.candidates();
+        (cands, job.run())
+    };
+    let (cands, r) = run(text);
+    let longest = |c: &[String]| c.iter().take(TOPK).map(|s| s.chars().count()).max().unwrap();
+    let key0 = tl.key_for_len(text, longest(&cands[0]));
+    assert!(key0.contains('\0') && key0 != tl.key_for(text), "premise: a boundary key, not version 5's: {key0:?}");
+    let before1 = format!("{text}{}{word}", cands[0][r.picks()[0]]);
+    let key1 = tl.key_for_len(&before1, longest(&cands[1]));
+    assert_eq!(r.keys(), vec![key0, key1]);
+    // the same last 8 characters behind a longer text: the same keys and picks
+    let (_, r2) = run(&format!("今天的天氣真好，我們出去玩Hello World。{text}"));
+    assert_eq!((r2.keys(), r2.picks()), (r.keys(), r.picks()));
 }
 
 /// docs/spec/semantic-rerank.md §10: with a model that declares no length, a left text ending in an English word ("我說Joe", whose Han
@@ -764,6 +798,11 @@ fn load_tinylm_errors_and_the_switch() {
     type_syls(&mut e, &syls);
     assert!(e.take_rerank_job().is_some(), "old model kept");
     e.key(k(KeyKind::Esc)).unwrap();
+    // A boundary-format header with V = 3 is a refused file (not a panic), and the loaded model stays.
+    assert!(e.load_tinylm(&v6_without_room_for_sep()).is_err());
+    type_syls(&mut e, &syls);
+    assert!(e.take_rerank_job().is_some(), "old model kept after the V 3 boundary file");
+    e.key(k(KeyKind::Esc)).unwrap();
     // The switch survives a load.
     e.set_rerank(false).unwrap();
     e.load_tinylm(&rerank_model()).unwrap();
@@ -915,7 +954,7 @@ fn replay_dev302_parity_and_measurements() {
             let surf: Vec<String> = nb.iter().take(TOPK).map(|(_, ws)| ws.concat()).collect();
             let ng: Vec<f64> = nb.iter().take(TOPK).map(|x| x.0).collect();
             let top: Vec<&str> = surf.iter().map(String::as_str).collect();
-            let pick = tl.rerank(&ng, &top, "", tl.alpha_tau_delta(Profile::Chat), &[], &Default::default(), &Default::default()).map_or(0, |r| r.0);
+            let pick = tl.rerank(&ng, &top, "", tl.alpha_tau_delta(Profile::Chat), &[], &Default::default()).map_or(0, |r| r.0);
             surf[pick].clone()
         })
         .collect();
@@ -1077,4 +1116,63 @@ fn a_manual_word_typed_with_an_adjacent_key_slip_survives_the_rerank() {
         }
     }
     assert!(tried >= 4, "{tried} slips tried");
+}
+
+/// docs/spec/english-mixed.md §5.7 (the English before the composition): with a small model that declares a left length loaded and English mixing
+/// on, a composition whose syllables are the reading of a mixed word of the letters the left text ends with shows the word's Han part. The
+/// rerank switch does not matter (the model stays loaded); English mixing off, no such model, other letters, another reading, or letters that
+/// may be the cut tail of a longer word leave every output as it is without the table.
+#[test]
+fn english_before_the_composition_takes_the_mixed_word() {
+    const TABLE: &str = "t\tㄒㄩˋ\tT恤\t1\nabcdefgh\tㄒㄩˋ\tabcdefgh恤\t1\nqq\tㄒㄩˋ\tQQ恤\t1\n";
+    let v5 = upgraded(&rerank_model(), Some(8));
+    let make = |model: Option<&Path>, table: bool| {
+        let mut e = engine_with(model);
+        e.set_english(true).unwrap();
+        assert!(!table || e.set_mixed_words(TABLE));
+        e
+    };
+    let shown = |e: &mut Engine, left: &str, syls: &[&str]| {
+        e.reset(ResetMode::Discard);
+        e.set_left_context(left);
+        type_syls(e, syls).preedit
+    };
+    let e_model = || make(Some(&v5), true);
+    let (mut e, mut plain) = (make(Some(&v5), true), make(Some(&v5), false));
+    let today = shown(&mut plain, "T", &["ㄒㄩˋ"]);
+    assert!(today != "恤" && plain.left_full_chars() == 1, "premise: the model keeps the letter, the decoder shows another character: {today}");
+    assert_eq!(shown(&mut e, "T", &["ㄒㄩˋ"]), "恤");
+    assert!(e.frozen_words().is_empty(), "the decoder's word (docs/spec/decoder.md §4.7): nothing is fixed");
+    assert_eq!(shown(&mut e, "今天穿T", &["ㄒㄩˋ"]), "恤", "a Han character before the letter");
+    assert_eq!(shown(&mut e, "abcdefgh", &["ㄒㄩˋ"]), "恤", "eight letters that are the whole text: not cut");
+    // The next syllable is decoded with it: the edge stands (without the table the two are one word).
+    let o = type_syls(&mut e, &["ㄕˋ"]);
+    assert!(e.frozen_words().is_empty() && o.preedit == "恤是", "{}", o.preedit);
+    assert!(!shown(&mut plain, "abcdefgh", &["ㄒㄩˋ", "ㄕˋ"]).starts_with('恤'), "premise");
+    // Not these.
+    for (left, syls) in [("Tx", &["ㄒㄩˋ"][..]), ("9T", &["ㄒㄩˋ"]), ("xabcdefgh", &["ㄒㄩˋ"]), ("T", &["ㄕˋ"]), ("T ", &["ㄒㄩˋ"]), ("", &["ㄒㄩˋ"])] {
+        assert_eq!(shown(&mut e, left, syls), shown(&mut plain, left, syls), "{left:?} {syls:?}");
+        assert!(e.frozen_words().is_empty(), "{left:?}");
+    }
+    // The row's reading and then the same syllable again: the first is the row's, the second is decoded behind it.
+    assert!(shown(&mut e, "T", &["ㄒㄩˋ", "ㄒㄩˋ"]).starts_with('恤') && e.left_full_chars() == 1);
+    // The rerank switch off: the model is still loaded.
+    e.set_rerank(false).unwrap();
+    assert_eq!(shown(&mut e, "T", &["ㄒㄩˋ"]), "恤");
+    // English mixing off.
+    e.set_english(false).unwrap();
+    plain.set_english(false).unwrap();
+    assert_eq!(shown(&mut e, "T", &["ㄒㄩˋ"]), shown(&mut plain, "T", &["ㄒㄩˋ"]));
+    assert!(e.frozen_words().is_empty());
+    // No model, or one that declares no length: the letter is not kept.
+    let v4 = upgraded(&rerank_model(), None);
+    for model in [None, Some(&*v4)] {
+        let (mut e, mut plain) = (make(model, true), make(model, false));
+        assert_eq!(shown(&mut e, "T", &["ㄒㄩˋ"]), shown(&mut plain, "T", &["ㄒㄩˋ"]));
+        assert!(e.left_full_chars() == 0 && e.frozen_words().is_empty());
+        // Two letters are kept without such a model (for the row behind English, docs/spec/semantic-rerank.md §5.2), and still the table's word is no candidate.
+        assert_eq!(shown(&mut e, "QQ", &["ㄒㄩˋ"]), shown(&mut plain, "QQ", &["ㄒㄩˋ"]));
+        assert!(e.left_full_chars() == 2 && e.frozen_words().is_empty(), "premise: the two letters are kept");
+    }
+    assert_eq!(shown(&mut e_model(), "QQ", &["ㄒㄩˋ"]), "恤", "control: with the model the same row applies");
 }

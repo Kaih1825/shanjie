@@ -7,13 +7,14 @@
 //!
 //! The constants MU, GATE_T and gamma = mu / 2 are the cell P4d registered and chatjudge-2 confirmed. The
 //! three (alpha, tau, delta) cells, one per strength (docs/spec/semantic-rerank.md §4.4), are the ones docs/spec/semantic-rerank.md §4.4
-//! registers for the 會意 SJ-SR-8-15M re-ranker; none of them comes from the `.sjtl` header.
+//! registers for the 會意 SJ-SR-10-31M re-ranker; none of them comes from the `.sjtl` header.
 use crate::lm::{Lm, LmError, Profile};
 use crate::tinylm::{pick_masked, RerankLevel, TinyLm};
 use std::collections::HashSet;
 use std::fmt;
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Weight of lc (P4d registered cell).
 pub const MU: f64 = 0.5;
@@ -21,14 +22,15 @@ pub const MU: f64 = 0.5;
 pub const GATE_T: f64 = 1.0;
 /// gamma / mu: col = lc - GAMMA_PER_MU * k, i.e. gamma = mu / 2 (P4d: P4c's mu 0.5 cell).
 pub const GAMMA_PER_MU: f64 = 0.5;
-/// The fusion's (alpha, tau, delta) under the colloquial term at the standard strength: docs/spec/semantic-rerank.md §4.4, the cell FUSE-1
-/// (wikijudge8) confirmed for the 會意 SJ-SR-8-15M re-ranker (docs/spec/semantic-rerank.md §4.4). The three cells here are the chat fusion at each
-/// strength; the `.sjtl` header's chat triples only back a col that is not finite.
-pub const STANDARD: (f64, f64, f64) = (1.1, 2.0, 0.0);
-/// The same at the conservative strength: the cell FUSE-2 (wikijudge9) confirmed.
-pub const CONSERVATIVE: (f64, f64, f64) = (1.3, 2.0, 1.0);
+/// The fusion's (alpha, tau, delta) under the colloquial term at the standard strength: the chat cell confirmed for the 會意 SJ-SR-10-31M re-ranker
+/// (BLP-20261012, confirm-blp1 on cjudge-3a; docs/spec/semantic-rerank.md §4.4). The three cells here are the chat fusion at each strength; the `.sjtl`
+/// header's chat triples only back a col that is not finite.
+pub const STANDARD: (f64, f64, f64) = (1.4, 2.0, 0.0);
+/// The same at the conservative strength: selected on the chat tuning sets by the FUSE-2 rule (sr10-ship section 2a: S1 ctune and cvtune-clean-tw0
+/// pooled, F 295 B 20 against the standard cell's F 422 B 78).
+pub const CONSERVATIVE: (f64, f64, f64) = (1.2, 2.0, 1.0);
 /// The same at the aggressive strength: the same cell as the standard one (docs/spec/semantic-rerank.md §4, "aggressive = the new standard").
-pub const AGGRESSIVE: (f64, f64, f64) = (1.1, 2.0, 0.0);
+pub const AGGRESSIVE: (f64, f64, f64) = (1.4, 2.0, 0.0);
 
 /// The (alpha, tau, delta) of the fusion at `level` (docs/spec/semantic-rerank.md §4.4).
 pub fn cell(level: RerankLevel) -> (f64, f64, f64) {
@@ -39,9 +41,9 @@ pub fn cell(level: RerankLevel) -> (f64, f64, f64) {
     }
 }
 
-/// SHA-256 of the `.sjtl` the cells were measured with (會意 SJ-SR-8-15M, SR-TW-V's V4-s3 weights with the formal cells of docs/spec/semantic-rerank.md §4
-/// docs/spec/semantic-rerank.md §4.6; data/tinylm.sjtl.sha256); the term applies to no other small model.
-pub const PAIRED_TINYLM_SHA256: &str = "356a37beede1a754cb6e963a52d0f20ae6574cbcd332d0b1bfc9686c0a97c5de";
+/// SHA-256 of the `.sjtl` the cells were measured with (會意 SJ-SR-10-31M: BLP-20261012 exported as int8 SJTL0006, left length 62, boundary K 4, with the
+/// formal cells of docs/spec/semantic-rerank.md §4; data/tinylm.sjtl.sha256); the term applies to no other small model.
+pub const PAIRED_TINYLM_SHA256: &str = "ee109fb284cbd5fea8db825752fec5b8a08deb6541d772dc682091e2c99c70d4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColloquialError {
@@ -64,10 +66,26 @@ impl fmt::Display for ColloquialError {
 }
 impl std::error::Error for ColloquialError {}
 
-pub struct Colloquial {
+/// The loaded table file, read-only afterwards: what engines share (`Engine::share`); the word sets of k are per engine (`Colloquial`).
+pub struct ColloquialTable {
     lm: Lm,
     /// N + V + 1 of the table, V counting `<s>` and `</s>` (colloquial_ref.py `Table.n1`).
     n1: f64,
+}
+
+impl ColloquialTable {
+    /// The table at `path` read as a plain bigram (no classes, no Kneser-Ney, no trigram, whatever sits beside the file).
+    pub fn load(path: &Path) -> Result<ColloquialTable, ColloquialError> {
+        let lm = Lm::load_opts(path, false, false, &[]).map_err(|_: LmError| ColloquialError::Table)?;
+        // `Lm` has no vocabulary-size accessor: `identity().1` is V + 1 (the length of the word-offset table), so N + V + 1 is
+        // N + identity().1.
+        let n1 = (lm.total() + lm.identity().1 as u64) as f64;
+        Ok(ColloquialTable { lm, n1 })
+    }
+}
+
+pub struct Colloquial {
+    table: Arc<ColloquialTable>,
     /// The words of overlay-add.tsv and of the packs the engine was built with (not names-add.tsv, not sandhi-add.tsv) that mcbpmf-data.txt
     /// lacks: the only words k counts, so the two full sets are never kept (keeping them cost about 10 MiB more peak RSS on a Mac, measured
     /// with 3 runs of `/usr/bin/time -l`).
@@ -93,10 +111,11 @@ impl Colloquial {
     /// from `base_text`, and the 17 MB overlay file is never held as text (peak RSS with the table: +27 to +30 MiB on a Mac before this,
     /// +16 to +21 MiB after; 3 runs each, `/usr/bin/time -l`).
     pub fn load(table: &Path, base_text: &str, overlay: impl BufRead, pack_text: Option<&str>) -> Result<Colloquial, ColloquialError> {
-        let lm = Lm::load_opts(table, false, false, &[]).map_err(|_: LmError| ColloquialError::Table)?;
-        // `Lm` has no vocabulary-size accessor: `identity().1` is V + 1 (the length of the word-offset table), so N + V + 1 is
-        // N + identity().1.
-        let n1 = (lm.total() + lm.identity().1 as u64) as f64;
+        Colloquial::with_table(Arc::new(ColloquialTable::load(table)?), base_text, overlay, pack_text)
+    }
+
+    /// `load` on a table already loaded: only the word sets of k are built (from `base_text`, `overlay` and `pack_text`, as `load` reads them).
+    pub fn with_table(table: Arc<ColloquialTable>, base_text: &str, overlay: impl BufRead, pack_text: Option<&str>) -> Result<Colloquial, ColloquialError> {
         let mut base: HashSet<&str> = HashSet::new();
         for l in base_text.lines() {
             let f: Vec<&str> = l.split_whitespace().collect();
@@ -117,7 +136,7 @@ impl Colloquial {
             take(&l.map_err(|_| ColloquialError::Read)?);
         }
         pack_text.unwrap_or("").lines().for_each(&mut take);
-        Ok(Colloquial { lm, n1, overlay_only, first_unigram: false, unseen_start_unigram: false })
+        Ok(Colloquial { table, overlay_only, first_unigram: false, unseen_start_unigram: false })
     }
 
     /// `load` with the base lexicon and the overlay read from `lexicon_dir` (`mcbpmf-data.txt`, `overlay-add.tsv`): the one place the engine
@@ -129,9 +148,14 @@ impl Colloquial {
         Colloquial::load(table, &base, std::io::BufReader::new(overlay), pack_text)
     }
 
+    /// The loaded table file, to share with another engine's `Colloquial` (`with_table`).
+    pub fn table(&self) -> &Arc<ColloquialTable> {
+        &self.table
+    }
+
     /// SHA-256 (hex) of the table file.
     pub fn sha256(&self) -> &str {
-        self.lm.sha256()
+        self.table.lm.sha256()
     }
 
     /// Turn the SR-TW-C first-word estimate on or off (`first_unigram`; off after `load`).
@@ -159,14 +183,15 @@ impl Colloquial {
     /// the first word's term is that back-off estimate (c(w) + 1) / (N + V + 1) itself, not P(w | `<s>`); with `unseen_start_unigram` the same
     /// holds only for a first word the table has no `<s>` bigram for (`Lm::has_bigram`). The other terms are unchanged.
     pub fn lc<S: AsRef<str>>(&self, words: &[S]) -> f64 {
+        let (lm, n1) = (&self.table.lm, self.table.n1);
         let (mut prev, mut tot) = ("<s>", 0.0);
         for (i, w) in words.iter().enumerate() {
             let w = w.as_ref();
-            let pb = (self.lm.count(w) + 1) as f64 / self.n1;
-            tot += if i == 0 && (self.first_unigram || (self.unseen_start_unigram && !self.lm.has_bigram(prev, w))) { pb } else { self.lm.prob(prev, w, pb) }.log10();
+            let pb = (lm.count(w) + 1) as f64 / n1;
+            tot += if i == 0 && (self.first_unigram || (self.unseen_start_unigram && !lm.has_bigram(prev, w))) { pb } else { lm.prob(prev, w, pb) }.log10();
             prev = w;
         }
-        tot + self.lm.eos(1.0, prev)
+        tot + lm.eos(1.0, prev)
     }
 
     /// k: words of the split in the overlay set and not in the base lexicon, repeats counted.
@@ -231,7 +256,8 @@ mod tests {
         assert!((a - b).abs() < 1e-12, "{a} vs {b}");
     }
 
-    /// The `.sjtl` header's chat standard triple of the 會意 SJ-SR-8-15M file (the fallback of a col that is not finite): not one of the three cells.
+    /// The `.sjtl` header's chat standard triple of the 會意 SJ-SR-10-31M file (the fallback of a col that is not finite; the same triple the 會意 SJ-SR-8-15M
+    /// file had): not one of the three cells.
     const HEADER_STANDARD: (f64, f64, f64) = (0.3, 2.0, 0.25);
 
     #[test]
@@ -262,16 +288,16 @@ mod tests {
         assert!(eff.iter().all(|x| x.is_finite()));
     }
 
-    /// The registered cell decides, not the header triple: with ng [-10.0, -10.3] and ll [-5.0, -4.2], candidate 1 gains 1.1 * 0.8 - 0.3 = 0.58 at the
-    /// standard alpha 1.1 (delta 0 takes it) but 1.3 * 0.8 - 0.3 = 0.74 at the conservative cell (below its delta 1) and 0.3 * 0.8 - 0.3 = -0.06 at the
-    /// header's alpha 0.3. With ll [-5.0, -3.8] the conservative gain is 1.3 * 1.2 - 0.3 = 1.26, which its delta 1 takes.
+    /// The registered cell decides, not the header triple: with ng [-10.0, -10.3] and ll [-5.0, -4.2], candidate 1 gains 1.4 * 0.8 - 0.3 = 0.82 at the
+    /// standard alpha 1.4 (delta 0 takes it) but 1.2 * 0.8 - 0.3 = 0.66 at the conservative cell (below its delta 1) and 0.3 * 0.8 - 0.3 = -0.06 at the
+    /// header's alpha 0.3. With ll [-5.0, -3.8] the conservative gain is 1.2 * 1.2 - 0.3 = 1.14, which its delta 1 takes.
     #[test]
     fn fused_pick_uses_the_registered_cell() {
-        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.2], &[0.0, 0.0], STANDARD, &[], &[]), 1, "alpha 1.1: gain 0.58 >= delta 0");
-        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.2], &[0.0, 0.0], CONSERVATIVE, &[], &[]), 0, "gain 0.74 < delta 1");
-        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -3.8], &[0.0, 0.0], CONSERVATIVE, &[], &[]), 1, "gain 1.26 >= delta 1");
+        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.2], &[0.0, 0.0], STANDARD, &[], &[]), 1, "alpha 1.4: gain 0.82 >= delta 0");
+        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.2], &[0.0, 0.0], CONSERVATIVE, &[], &[]), 0, "gain 0.66 < delta 1");
+        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -3.8], &[0.0, 0.0], CONSERVATIVE, &[], &[]), 1, "gain 1.14 >= delta 1");
         assert_eq!(pick(&[-10.0, -10.3], &[-5.0, -4.2], HEADER_STANDARD.0, HEADER_STANDARD.1, HEADER_STANDARD.2), 0, "premise: the header triple keeps the first");
-        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.8], &[0.0, 0.0], STANDARD, &[], &[]), 0, "gain 1.1 * 0.2 - 0.3 < delta 0");
+        assert_eq!(fused_pick(&[-10.0, -10.3], &[-5.0, -4.8], &[0.0, 0.0], STANDARD, &[], &[]), 0, "gain 1.4 * 0.2 - 0.3 < delta 0");
         // tau: an n-gram margin of 2 or more keeps the first whatever the small model says
         assert_eq!(fused_pick(&[-10.0, -12.0], &[-50.0, 0.0], &[0.0, 0.0], STANDARD, &[], &[]), 0);
         assert_eq!(fused_pick(&[-10.0, -11.9], &[-50.0, 0.0], &[0.0, 0.0], STANDARD, &[], &[]), 1);
@@ -314,19 +340,19 @@ mod tests {
     }
 
     /// docs/spec/semantic-rerank.md §4.4: each level's `fused_pick` uses its own (alpha, tau, delta). With no colloquial or channel term (equal col) a
-    /// candidate gains alpha * dll - dng over candidate 0. List 1 (dng 1.0, dll 0.8) gains 0.88 - 1.0 < 0 at the standard (and aggressive) alpha 1.1 and
-    /// 1.04 - 1.0 = 0.04 at the conservative alpha 1.3 (delta 1): no level takes it; list 2 (dng 0.4, dll 0.8) gains 0.48, which the standard delta 0
-    /// takes and the conservative delta 1 does not (0.64); list 3 (dng 1.9, dll 5) gains 3.6 and 4.6: all take it. The aggressive cell is the standard
+    /// candidate gains alpha * dll - dng over candidate 0. List 1 (dng 1.0, dll 0.6) gains 0.84 - 1.0 < 0 at the standard (and aggressive) alpha 1.4 and
+    /// 0.72 - 1.0 < 0 at the conservative alpha 1.2: no level takes it; list 2 (dng 0.4, dll 0.8) gains 0.72, which the standard delta 0
+    /// takes and the conservative delta 1 does not (0.56); list 3 (dng 1.9, dll 5) gains 5.1 and 4.1: all take it. The aggressive cell is the standard
     /// one (docs/spec/semantic-rerank.md §4.4), so those two rows are equal.
     #[test]
     fn each_level_picks_with_its_own_cell() {
-        let lists = [([0.0, -1.0], [0.0, 0.8]), ([0.0, -0.4], [0.0, 0.8]), ([0.0, -1.9], [0.0, 5.0])];
+        let lists = [([0.0, -1.0], [0.0, 0.6]), ([0.0, -0.4], [0.0, 0.8]), ([0.0, -1.9], [0.0, 5.0])];
         let by_level = |l| lists.map(|(ng, ll)| fused_pick(&ng, &ll, &[0.0; 2], cell(l), &[], &[]));
         assert_eq!(by_level(RerankLevel::Standard), [0, 1, 1]);
         assert_eq!(by_level(RerankLevel::Conservative), [0, 0, 1]);
         assert_eq!(by_level(RerankLevel::Aggressive), [0, 1, 1]);
-        assert_eq!(STANDARD, (1.1, 2.0, 0.0));
-        assert_eq!(CONSERVATIVE, (1.3, 2.0, 1.0));
+        assert_eq!(STANDARD, (1.4, 2.0, 0.0));
+        assert_eq!(CONSERVATIVE, (1.2, 2.0, 1.0));
         assert_eq!(AGGRESSIVE, STANDARD);
         assert_eq!([cell(RerankLevel::Standard), cell(RerankLevel::Conservative), cell(RerankLevel::Aggressive)], [STANDARD, CONSERVATIVE, AGGRESSIVE]);
     }

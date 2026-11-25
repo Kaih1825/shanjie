@@ -75,9 +75,9 @@ for lp in "zh-Hant|$NAME_ZH" "en|$NAME_EN"; do
     [ "$(pb "$k" "$S")" = "$name" ] || fail "$l InfoPlist.strings: $k"
   done
 done
-for f in mcbpmf-data.txt overlay-add.tsv sandhi-add.tsv names-add.tsv demote.tsv variant-order.tsv std-exempt.tsv rerank-protect.tsv digits.tsv mixed-words.tsv models.tsv shanjie.tiff \
+for f in mcbpmf-data.txt overlay-add.tsv sandhi-add.tsv names-add.tsv demote.tsv variant-order.tsv std-exempt.tsv rerank-protect.tsv digits.tsv mixed-words.tsv english.tsv models.tsv shanjie.tiff \
          packs/acg-add.tsv packs/acg-sources.tsv packs/acg.json packs/it-add.tsv packs/it-sources.tsv packs/it.json packs/beauty-add.tsv packs/beauty-sources.tsv packs/beauty.json packs/meme-add.tsv packs/meme-sources.tsv packs/meme.json packs/quotes-add.tsv packs/quotes.json LICENSES/LICENSE LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/CC-BY-SA-4.0-attribution.txt \
-         LICENSES/name-suggestion-index-BSD-3-Clause.txt LICENSES/Sparkle-MIT.txt LICENSES/colloquial-attribution.tsv; do
+         LICENSES/name-suggestion-index-BSD-3-Clause.txt LICENSES/Sparkle-MIT.txt LICENSES/colloquial-attribution.tsv LICENSES/MOE-dict-revised-terms.txt LICENSES/MOE-dict-concised-terms.txt; do
   [ -s "$R/$f" ] || fail "Resources/$f is missing or empty"
 done
 # The models: the bundled models.tsv is the list (docs/spec/models.md §1.3), checked both ways against the files.
@@ -87,6 +87,8 @@ cmp -s "$R/models.tsv" "$(dirname "$0")/../data/models.tsv" || fail "Resources/m
 cmp -s "$R/digits.tsv" "$(dirname "$0")/../data/lexicon/digits.tsv" || fail "Resources/digits.tsv differs from data/lexicon/digits.tsv"
 # So is mixed-words.tsv (a missing or bad table leaves the mixed words out of the candidate list without a word).
 cmp -s "$R/mixed-words.tsv" "$(dirname "$0")/../data/lexicon/mixed-words.tsv" || fail "Resources/mixed-words.tsv differs from data/lexicon/mixed-words.tsv"
+# So is english.tsv (without it the closing-key comparison of docs/spec/english-mixed.md §16 never happens, and nothing says so).
+cmp -s "$R/english.tsv" "$(dirname "$0")/../data/lexicon/english.tsv" || fail "Resources/english.tsv differs from data/lexicon/english.tsv"
 # The app icon (docs/spec/macos-shell.md §1.4): compiled by actool, named in Info.plist.
 for f in Assets.car AppIcon.icns; do [ -s "$R/$f" ] || fail "Resources/$f (the app icon) is missing or empty"; done
 for k in CFBundleIconName CFBundleIconFile; do [ "$(pb "$k")" = AppIcon ] || fail "Info.plist $k is not AppIcon"; done
@@ -165,6 +167,10 @@ sparkle_key SUEnableSystemProfiling bool false
 # Sparkle's licence (MIT, with the third-party notices its LICENSE carries): the bundled copy is the committed one.
 cmp -s "$R/LICENSES/Sparkle-MIT.txt" "$ROOT/LICENSES/Sparkle-MIT.txt" || fail "Resources/LICENSES/Sparkle-MIT.txt differs from LICENSES/Sparkle-MIT.txt"
 grep -q 'EXTERNAL LICENSES' "$R/LICENSES/Sparkle-MIT.txt" || fail "Sparkle-MIT.txt lacks the third-party notices"
+# The Ministry of Education's notices of use for the two dictionaries (docs/spec/decoder.md §8.7): the bundled copies are the committed ones, whole.
+for f in MOE-dict-revised-terms.txt MOE-dict-concised-terms.txt; do
+  cmp -s "$R/LICENSES/$f" "$ROOT/LICENSES/$f" || fail "Resources/LICENSES/$f differs from LICENSES/$f"
+done
 # The trigram tables (trigram-core; the formal profile's trigram.sjt3 and the chat profile's trigram-chat.sjt3): both listed in the attribution file.
 grep -q 'trigram.sjt3' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not list trigram.sjt3"
 grep -q 'trigram-chat.sjt3' "$R/LICENSES/CC-BY-SA-4.0-attribution.txt" || fail "the attribution file does not list trigram-chat.sjt3"

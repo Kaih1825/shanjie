@@ -10,9 +10,15 @@ publish = false
 [features]
 # §5.8: numbers-only timing file (host-<pid>.txt), for the VM measurements; never in a build given to users.
 timing = []
+# The identity of the installer's build (shanjie-win-proto, ids.rs); off: the development identity.
+release-ids = ["shanjie-win-proto/release-ids"]
 
 [dependencies]
 shanjie-win-proto = { path = "../proto" }
+
+# The engine module's tests run on every platform (main.rs); off Windows the core is needed only by them.
+[target.'cfg(not(windows))'.dev-dependencies]
+shanjie_core = { package = "core", path = "../../core" }
 
 [target.'cfg(windows)'.dependencies]
 # The core's package is named `core`, which shadows `::core` paths emitted by the windows macros: renamed (docs/spec/windows-tip.md §3.1).
@@ -34,4 +40,5 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
+    "Win32_UI_TextServices",
 ] }

@@ -28,6 +28,8 @@
 #                    a release or an update test build (Info.plist ShanjieUpdateBuild: release, test, or local for
 #                    every other build), so a copy built here and installed never reads the production feed. Requires
 #                    the shipping BUNDLE_ID.
+#   SHANJIE_TIMING   1: the timing build (docs/spec/semantic-rerank.md §8.6), compiled with -DSHANJIE_TIMING. A measuring build only:
+#                    refused together with SHANJIE_RELEASE_BUILD. Unset, the swift build command is the same as without it.
 #
 # The folder name is the user-facing name; the executable (Contents/MacOS/shanjie), the bundle ID and
 # the release asset (shanjie-<version>.zip) keep the ASCII name.
@@ -58,11 +60,11 @@ shasum -a 256 -c data/classes.sjc.sha256 >/dev/null \
   gh release download sj-kn-2-397k -R Nanako0129/shanjie -p kn.sjkn -D data/lm"
 shasum -a 256 -c data/kn.sjkn.sha256 >/dev/null \
   || fail "data/lm/kn.sjkn does not match data/kn.sjkn.sha256; download sj-kn-2-397k again"
-# The small model behind 語意校正 (docs/spec/semantic-rerank.md §8.3), paired with sj-lm-7-9.7m's and sj-kn-2-397k's hashes (SJTL0004).
-[ -f data/lm/tinylm.sjtl ] || fail "data/lm/tinylm.sjtl is missing (the small model of 語意校正, S7c). Download the sj-sr-8-15m release asset:
-  gh release download sj-sr-8-15m -R Nanako0129/shanjie -p tinylm.sjtl -D data/lm"
+# The small model behind 語意校正 (docs/spec/semantic-rerank.md §8.3), paired with sj-lm-7-9.7m's and sj-kn-2-397k's hashes (SJTL0006).
+[ -f data/lm/tinylm.sjtl ] || fail "data/lm/tinylm.sjtl is missing (the small model of 語意校正, S7c). Download the sj-sr-10-31m release asset (會意 SJ-SR-10-31M):
+  gh release download sj-sr-10-31m -R Nanako0129/shanjie -p tinylm.sjtl -D data/lm"
 shasum -a 256 -c data/tinylm.sjtl.sha256 >/dev/null \
-  || fail "data/lm/tinylm.sjtl does not match data/tinylm.sjtl.sha256; download sj-sr-8-15m again"
+  || fail "data/lm/tinylm.sjtl does not match data/tinylm.sjtl.sha256; download sj-sr-10-31m (會意 SJ-SR-10-31M) again"
 # The trigram table of the formal profile (docs/spec/decoder.md §3.4): bound to the bigram model's hash; the core loads it from beside the model.
 [ -f data/lm/trigram.sjt3 ] || fail "data/lm/trigram.sjt3 is missing (the trigram table of the formal profile). Download the sj-cx-2-7.7m release asset:
   gh release download sj-cx-2-7.7m -R Nanako0129/shanjie -p trigram.sjt3 -D data/lm"
@@ -84,7 +86,7 @@ shasum -a 256 -c data/colloquial.sjlm.sha256 data/colloquial-attribution.tsv.sha
   || fail "data/lm/colloquial.sjlm or colloquial-attribution.tsv does not match its data/*.sha256; download sj-cl-2-69k again"
 # The one list of bundled models and their About-page names (docs/spec/models.md): hashes against data/*.sha256 and data/lm.
 scripts/check-models.sh build "$ROOT" || exit 1
-for f in data/lexicon/mcbpmf-data.txt data/lexicon/overlay-add.tsv data/lexicon/sandhi-add.tsv data/lexicon/names-add.tsv data/lexicon/mixed-words.tsv data/lexicon/demote.tsv data/lexicon/variant-order.tsv data/lexicon/std-exempt.tsv data/lexicon/rerank-protect.tsv data/lexicon/digits.tsv data/packs/acg-add.tsv data/packs/acg-sources.tsv data/packs/acg.json data/packs/it-add.tsv data/packs/it-sources.tsv data/packs/it.json data/packs/beauty-add.tsv data/packs/beauty-sources.tsv data/packs/beauty.json data/packs/meme-add.tsv data/packs/meme-sources.tsv data/packs/meme.json data/packs/quotes-add.tsv data/packs/quotes.json LICENSE LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/name-suggestion-index-BSD-3-Clause.txt LICENSES/Sparkle-MIT.txt; do
+for f in data/lexicon/mcbpmf-data.txt data/lexicon/overlay-add.tsv data/lexicon/sandhi-add.tsv data/lexicon/names-add.tsv data/lexicon/mixed-words.tsv data/lexicon/english.tsv data/lexicon/demote.tsv data/lexicon/variant-order.tsv data/lexicon/std-exempt.tsv data/lexicon/rerank-protect.tsv data/lexicon/digits.tsv data/packs/acg-add.tsv data/packs/acg-sources.tsv data/packs/acg.json data/packs/it-add.tsv data/packs/it-sources.tsv data/packs/it.json data/packs/beauty-add.tsv data/packs/beauty-sources.tsv data/packs/beauty.json data/packs/meme-add.tsv data/packs/meme-sources.tsv data/packs/meme.json data/packs/quotes-add.tsv data/packs/quotes.json LICENSE LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/name-suggestion-index-BSD-3-Clause.txt LICENSES/Sparkle-MIT.txt LICENSES/MOE-dict-revised-terms.txt LICENSES/MOE-dict-concised-terms.txt; do
   [ -f "$f" ] || fail "$f is missing"
 done
 
@@ -138,9 +140,17 @@ esac
 # An EdDSA public key is 32 bytes: 44 base64 characters ending in one '='.
 [[ "$ED_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail "the Sparkle public key is not 44 base64 characters"
 
+TIMING_FLAGS=()
+case "${SHANJIE_TIMING:-}" in
+  "") ;;
+  1) [ -z "${SHANJIE_RELEASE_BUILD:-}" ] || fail "SHANJIE_TIMING and SHANJIE_RELEASE_BUILD exclude each other"
+     TIMING_FLAGS=(-Xswiftc -DSHANJIE_TIMING) ;;
+  *) fail "SHANJIE_TIMING must be 1 or unset" ;;
+esac
+
 cargo build --release --locked -p core
 # --force-resolved-versions: Sparkle exactly as macos/Package.resolved pins it, never re-resolved.
-swift build -c release --package-path macos --force-resolved-versions
+swift build -c release --package-path macos --force-resolved-versions ${TIMING_FLAGS[@]+"${TIMING_FLAGS[@]}"}
 BIN_DIR="$(swift build -c release --package-path macos --force-resolved-versions --show-bin-path)"
 BIN="$BIN_DIR/Shanjie"
 [ -x "$BIN" ] || fail "the Swift build produced no executable"
@@ -199,6 +209,9 @@ cp data/lexicon/digits.tsv "$RES/"
 # mixed-words.tsv: the English+Chinese words of the candidate list (docs/spec/english-mixed.md §5.7). Optional for the core like digits.tsv,
 # so check-app.sh requires it and compares it with this file.
 cp data/lexicon/mixed-words.tsv "$RES/"
+# english.tsv: the count table of "English or Zhuyin at the closing key" (docs/spec/english-mixed.md §16.5). Optional for the core like digits.tsv
+# (a missing table turns the comparison off without a word), so check-app.sh requires it and compares it with this file.
+cp data/lexicon/english.tsv "$RES/"
 # The optional word packs (docs/spec/lexicon-and-packs.md §4.1, §4.2): the runtime files only, not the build inputs
 # (acg-groups.tsv, acg-collisions.tsv, acg-exclude.tsv, acg-manual.tsv, quotes-manual.tsv). The shell passes Resources/packs to shanjie_engine_new_packs.
 mkdir -p "$RES/packs"
@@ -244,12 +257,15 @@ plutil -lint "$HELPER/Contents/Info.plist" >/dev/null
 
 cp LICENSE "$RES/LICENSES/LICENSE"
 cp LICENSES/McBopomofo-MIT.txt LICENSES/data.md LICENSES/name-suggestion-index-BSD-3-Clause.txt "$RES/LICENSES/"
+# The Ministry of Education's notices of use for its two dictionaries (CC BY-ND 3.0 TW), whole, as their section 二 requires: the dictionaries decide which
+# words get the `colloq` rows of sandhi-add.tsv and overlay-add.tsv (docs/spec/decoder.md §8.7) and readings of overlay-add.tsv and std-exempt.tsv.
+cp LICENSES/MOE-dict-revised-terms.txt LICENSES/MOE-dict-concised-terms.txt "$RES/LICENSES/"
 # Sparkle.framework ships in Contents/Frameworks/Updater: its MIT notice with the bundled third-party notices (Sparkle's LICENSE, 2.10.0).
 cp LICENSES/Sparkle-MIT.txt "$RES/LICENSES/"
 # The per-unit attribution of the colloquial table's public sentences (docs/spec/semantic-rerank.md §4.7); no corpus text in it.
 cp -L data/lm/colloquial-attribution.tsv "$RES/LICENSES/"
 cat > "$RES/LICENSES/CC-BY-SA-4.0-attribution.txt" <<'EOF'
-overlay-add.tsv, names-add.tsv, packs/acg-add.tsv, packs/acg-sources.tsv, packs/acg.json, packs/it-add.tsv, packs/it-sources.tsv, packs/it.json, packs/meme-add.tsv, packs/meme-sources.tsv, packs/meme.json, demote.tsv, std-exempt.tsv, digits.tsv, bigram.sjlm,
+overlay-add.tsv, names-add.tsv, packs/acg-add.tsv, packs/acg-sources.tsv, packs/acg.json, packs/it-add.tsv, packs/it-sources.tsv, packs/it.json, packs/meme-add.tsv, packs/meme-sources.tsv, packs/meme.json, demote.tsv, std-exempt.tsv, digits.tsv, english.tsv, bigram.sjlm,
 classes.sjc, kn.sjkn, trigram.sjt3, trigram-chat.sjt3, tinylm.sjtl and colloquial.sjlm are licensed under the Creative Commons Attribution-ShareAlike 4.0 International license
 (CC BY-SA 4.0):
 https://creativecommons.org/licenses/by-sa/4.0/
@@ -290,9 +306,10 @@ demote.tsv: written for this project; no third-party data.
 variant-order.tsv: written for this project and dedicated to the public domain (CC0 1.0); no third-party data. It is not part of the CC BY-SA list above.
 rerank-protect.tsv: written for this project and dedicated to the public domain (CC0 1.0); no third-party data. The words the semantic rerank may not
   take out of the n-gram's first choice. It is not part of the CC BY-SA list above.
-std-exempt.tsv: the 12 (reading, character) pairs the decoder's reading term does not charge. Chosen by comparing the readings of
-  mcbpmf-data.txt with the first reading of each character in the Ministry of Education's 《國語辭典簡編本》
-  (CC BY-ND 3.0 Taiwan; only used to decide these readings, none of its data is in the file or distributed).
+std-exempt.tsv: the 16 (reading, character) pairs the decoder's reading term does not charge. Chosen by comparing the readings of
+  mcbpmf-data.txt with the first reading of each character in the Ministry of Education's 《國語辭典簡編本》 (12 pairs) and with
+  the characters its 《重編國語辭典修訂本》 gives a single reading (4 pairs)
+  (both CC BY-ND 3.0 Taiwan; only used to decide these readings, none of their data is in the file or distributed).
 bigram.sjlm: word counts from Wikipedia articles, Mozilla Common Voice
   sentences (CC0), Tatoeba sentences (CC BY 2.0 FR), synthetic sentences,
   public messages of the g0v Slack #rand0m channel (CC0) and articles and

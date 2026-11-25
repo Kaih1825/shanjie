@@ -8,9 +8,10 @@ fn run(args: &[&str]) -> String {
 
 /// `run` for the LM-mode goldens that the Python reference (`reference/proto/lm_eval.py`) produced: Python has no reading term
 /// (docs/spec/decoder.md §5), so they are compared with `--no-reading-decode`, the decoder it implements. The shipping default, which has the term,
-/// is pinned by `shipping_default_matches_its_rust_only_pins`.
+/// is pinned by `shipping_default_matches_its_rust_only_pins`. Python has no context-recurrence term either: `--no-recur`; nor third-tone sandhi
+/// (docs/spec/decoder.md §6.6): `--no-tone3`.
 fn run_py(args: &[&str]) -> String {
-    run(&[args, &["--no-reading-decode"]].concat())
+    run(&[args, &["--no-reading-decode", "--no-recur", "--no-tone3"]].concat())
 }
 
 #[test]
@@ -109,6 +110,9 @@ fn lm_context_mode_matches_golden_byte_for_byte() {
 /// the user-reported rows, in both profiles: first the s2h arguments (`--context`, the n-gram alone), then the shipping flags (`--context --packs acg,it,meme,beauty
 /// --tinylm data/lm/tinylm.sjtl`, chat also `--colloquial-core data/lm/colloquial.sjlm`, with `--name <set>-ship`). Regenerate with the same loop when a row is
 /// added to eval/dev/user-reported.txt (CONTRIBUTING.md, "Reported typos") or a model file changes: eval/golden/reading-decode-shipping.txt.
+/// The default has the context recurrence term (docs/spec/decoder.md §4.6), so every line's tag has `+recur` (the n-gram-only lines too: `--context` builds
+/// the set from the row's context column), and the shipping lines also its pool weight (docs/spec/semantic-rerank.md §3.1.1: `+recur+pr`, which picks the
+/// same rows here: no context of these sets reaches 32 characters with a recurring pair in a pool).
 #[test]
 fn shipping_default_matches_its_rust_only_pins() {
     let (lm, root) = (lm_path(), concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
@@ -357,8 +361,8 @@ fn kn_side_file_beside_the_model_is_announced_and_can_be_turned_off() {
     let (lm, rows) = (format!("{root}/eval/golden/kn-tiny/bigram.sjlm"), std::env::temp_dir().join(format!("shanjie-kn-rows-{}.txt", std::process::id())));
     std::fs::write(&rows, "|他占|ㄊㄚ ㄓㄢˋ\n").unwrap();
     let args = |extra: &[&'static str]| {
-        // the tags are lm_eval.py's: no reading term (docs/spec/decoder.md §5)
-        let mut a = vec!["--lm", lm.as_str(), "--profile", "chat", "--rows", rows.to_str().unwrap(), "--name", "t", "--no-reading-decode"];
+        // the tags are lm_eval.py's: no reading term (docs/spec/decoder.md §5), no third-tone sandhi (§6.6)
+        let mut a = vec!["--lm", lm.as_str(), "--profile", "chat", "--rows", rows.to_str().unwrap(), "--name", "t", "--no-reading-decode", "--no-tone3"];
         a.extend(extra);
         run(&a)
     };
@@ -385,8 +389,8 @@ fn each_profile_reads_only_its_own_trigram_table() {
     let (lm, rows) = (dir.join("bigram.sjlm"), dir.join("rows.txt"));
     std::fs::write(&rows, "|他占|ㄊㄚ ㄓㄢˋ\n").unwrap();
     let go = |extra: &[&str]| {
-        // the tags are lm_eval.py's: no reading term (docs/spec/decoder.md §5)
-        let mut a = vec!["--lm", lm.to_str().unwrap(), "--rows", rows.to_str().unwrap(), "--name", "t", "--no-reading-decode"];
+        // the tags are lm_eval.py's: no reading term (docs/spec/decoder.md §5), no third-tone sandhi (§6.6)
+        let mut a = vec!["--lm", lm.to_str().unwrap(), "--rows", rows.to_str().unwrap(), "--name", "t", "--no-reading-decode", "--no-tone3"];
         a.extend(extra);
         let out = Command::new(env!("CARGO_BIN_EXE_shanjie-eval")).args(&a).output().unwrap();
         (out.status.success(), String::from_utf8(out.stdout).unwrap())
@@ -462,8 +466,14 @@ fn predict_no_kn_scores_differently_from_the_golden() {
 /// which fixed row 4 `米雅歌` in formal at standard and aggressive strength (the rerank used to pick 米亞哥; measured 2026-10-27 on the final files).
 /// Measured 2026-10-27 on the final files (`rowstats`, i.e. after the rerank; chat is run without and with `--colloquial-core`, the two rerank paths) and pinned
 /// exactly, so any other row dropping, or a miss going away, fails here; the remaining misses are not the rerank's (their `--tinylm-scores` rows have `c` 0):
-/// formal row 8 `米雅歌唱得很好` at all three strengths (the n-gram's first is already 米亞歌唱得很好; known since classes-v5, μ 0.8 → 0.2, docs/spec/models.md §5.2)
-/// and chat row 8 at conservative strength without the colloquial table (the n-gram's first holds 米雅歌 but reads 唱的, not 唱得; the mask removed the other six candidates).
+/// chat row 8 `米雅歌唱得很好` without the colloquial table (the n-gram's first holds 米雅歌 but reads 唱的, not 唱得; the mask removed six of the other seven candidates).
+/// Measured again 2026-11-23 on the 會意 SJ-SR-10-31M file (`target/release/shanjie-eval --lm data/lm/bigram.sjlm --profile P --context --packs acg --tinylm
+/// data/lm/tinylm.sjtl --rerank-level L [--colloquial-core data/lm/colloquial.sjlm] --rows eval/golden/manual-words-rows.txt --tinylm-scores OUT --dump OUT2`):
+/// that chat miss is now at all three strengths (`c` 0 each time; with the 會意 SJ-SR-8-15M file only at conservative), and formal has none (row 8 was missed at all
+/// three strengths with the earlier file).
+/// Rows 16-19 (2026-11-25) are the two base words whose manual row adds a reading the base lacks (§2.9 of docs/spec/lexicon-and-packs.md):
+/// 為啥 under ㄨㄟˋ ㄕㄚˊ and 不足為外人道 under ㄨㄟˋ, alone and in a sentence; measured first at all nine settings, so the misses are unchanged.
+/// Rows 20-21 (2026-11-25): 部署 under ㄅㄨˋ ㄕㄨˇ (the reported typo, row 199 of eval/dev/user-reported.txt), alone and in that sentence; first at all nine.
 #[test]
 fn manual_words_come_first_in_the_shipping_setting() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
@@ -475,9 +485,9 @@ fn manual_words_come_first_in_the_shipping_setting() {
     let none: Vec<&str> = vec![];
     // (profile, with the colloquial table, [conservative, standard, aggressive] misses)
     let settings = [
-        ("chat", false, [vec!["8"], none.clone(), none.clone()]),
+        ("chat", false, [vec!["8"], vec!["8"], vec!["8"]]),
         ("chat", true, [none.clone(), none.clone(), none.clone()]),
-        ("formal", false, [vec!["8"], vec!["8"], vec!["8"]]),
+        ("formal", false, [none.clone(), none.clone(), none.clone()]),
     ];
     for (profile, with_colloquial, per_level) in settings {
         for (level, misses) in ["conservative", "standard", "aggressive"].into_iter().zip(per_level) {
@@ -489,12 +499,40 @@ fn manual_words_come_first_in_the_shipping_setting() {
             args.extend(["--rowstats", stats.to_str().unwrap()]);
             run(&args);
             let got = std::fs::read_to_string(&stats).unwrap();
-            assert_eq!(got.lines().count(), 15, "{profile} {level}");
+            assert_eq!(got.lines().count(), 21, "{profile} {level}");
             let got: Vec<&str> = got.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f[1] == "0").map(|f| f[0]).collect();
             assert_eq!(got, misses, "{profile} colloquial {with_colloquial} {level}: rows whose manual word is not first");
         }
     }
     std::fs::remove_file(&stats).unwrap();
+}
+
+/// docs/spec/lexicon-and-packs.md §2.9 (reading refill): under the reading the manual row adds, the n-gram's own first choice is the base word, with the
+/// shipping packs and no rerank. That is what the App sends when the rerank, which runs in the background, has not finished before the next key; with
+/// the rerank the shipping CLI already sent 為啥 before the row existed (it was the n-gram's third in chat and second in formal, under 位啥), so only
+/// this setting tells whether the row is there. The base reading ㄨㄟˊ keeps giving the same word. No `--colloquial-core`: without `--tinylm` that term is off.
+/// 部署 under ㄅㄨˋ ㄕㄨˇ (2026-11-25) is the n-gram's first only because a refill row takes the base word's own score when that is higher (§2.9): with the
+/// length score plus the bonus (-6.42 against the base -5.19) the chat n-gram gave 部屬.
+#[test]
+fn manual_reading_refills_are_the_ngram_first_choice() {
+    let dir = std::env::temp_dir().join(format!("shanjie-refill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (rows, stats) = (dir.join("rows.txt"), dir.join("rows.rowstats"));
+    std::fs::write(
+        &rows,
+        "|為啥|ㄨㄟˋ ㄕㄚˊ\n|為啥|ㄨㄟˊ ㄕㄚˊ\n|不足為外人道|ㄅㄨˋ ㄗㄨˊ ㄨㄟˋ ㄨㄞˋ ㄖㄣˊ ㄉㄠˋ\n|不足為外人道|ㄅㄨˋ ㄗㄨˊ ㄨㄟˊ ㄨㄞˋ ㄖㄣˊ ㄉㄠˋ\n|部署|ㄅㄨˋ ㄕㄨˇ\n|部署|ㄅㄨˋ ㄕㄨˋ\n",
+    )
+    .unwrap();
+    let lm = lm_path();
+    for profile in ["chat", "formal"] {
+        let _ = std::fs::remove_file(&stats);
+        run(&["--lm", &lm, "--profile", profile, "--context", "--packs", "acg,it,meme,beauty", "--rows", rows.to_str().unwrap(), "--rowstats", stats.to_str().unwrap()]);
+        let got = std::fs::read_to_string(&stats).unwrap();
+        let misses: Vec<&str> = got.lines().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f[1] == "0").map(|f| f[0]).collect();
+        assert_eq!(got.lines().count(), 6, "{profile}");
+        assert!(misses.is_empty(), "{profile}: rows whose word is not the n-gram's first choice: {misses:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// docs/spec/lexicon-and-packs.md §3.6: `--extra-overlay FILE` makes the file's word the first candidate (and only then), and a
