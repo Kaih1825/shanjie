@@ -2136,34 +2136,18 @@ impl Engine {
     /// Personal fork: the 3 to 4 character words on the path at commit that no record covers yet (a name typed straight and decoded right), so
     /// the prediction row can lead with them next time.
     fn typed_words(&self) -> Vec<(Vec<String>, String)> {
+        // Only whole path words: spans made of several words (突然+不, 推+眼鏡+才) were mostly noise and, as new words, fed back into decoding.
         let mut out = Vec::new();
-        let toks: Vec<(usize, &str, usize)> = self.path.iter().zip(self.path_starts()).map(|(p, s)| (s, p.word.as_str(), p.syllables)).collect();
-        let ok = |t: &(usize, &str, usize)| t.1.chars().count() == t.2 && t.1.chars().all(|c| is_han(c) && !NEWWORD_BREAK.contains(c)) && t.0 + t.2 <= self.syls.len();
-        for i in 0..toks.len() {
-            let (mut chars, mut single) = (0usize, false);
-            let mut text = String::new();
-            for t in &toks[i..] {
-                if !ok(t) || self.is_punct(t.0) {
-                    break;
-                }
-                chars += t.2;
-                single |= t.2 == 1;
-                text.push_str(t.1);
-                if chars > NEWWORD_MAX {
-                    break;
-                }
-                let whole_token = i == toks.len() || std::ptr::eq(t, &toks[i]);
-                // One lexicon-length word, or a run of tokens (a name the lexicon splits as surname + given name).
-                if chars >= 3 && (whole_token || single) {
-                    let reading = &self.syls[toks[i].0..toks[i].0 + chars];
-                    if (whole_token || !self.in_lexicon(reading, &text)) && self.learner.new_word_day(reading, &text).is_none() {
-                        out.push((reading.to_vec(), text.clone()));
-                    }
-                }
+        for (p, s) in self.path.iter().zip(self.path_starts()) {
+            let n = p.word.chars().count();
+            if p.is_punct || !(3..=NEWWORD_MAX).contains(&n) || p.syllables != n || s + n > self.syls.len() || !p.word.chars().all(is_han) {
+                continue;
+            }
+            let reading = &self.syls[s..s + n];
+            if self.learner.new_word_day(reading, &p.word).is_none() {
+                out.push((reading.to_vec(), p.word.clone()));
             }
         }
-        let mut seen = HashSet::new();
-        out.retain(|x| seen.insert(x.clone()));
         out
     }
 
